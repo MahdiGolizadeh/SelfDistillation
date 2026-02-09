@@ -76,13 +76,15 @@ class Model(torch.nn.Module):
         >>> metrics = model.val()
         >>> model.export(format="onnx")
     """
+    FORCED_MODEL = "yolo11n.pt"
 
     def __init__(
         self,
-        model: Union[str, Path, "Model"] = "yolo11n.pt",
+        model: Union[str, Path, "Model", None] = None,
         task: str = None,
         verbose: bool = False,
     ) -> None:
+
         """
         Initialize a new instance of the YOLO model class.
 
@@ -124,7 +126,17 @@ class Model(torch.nn.Module):
         self.session = None  # HUB session
         self.task = task  # task type
         self.model_name = None  # model name
-        model = str(model).strip()
+        requested_model = "" if model is None else str(model).strip()
+        use_pretrained = bool(requested_model)
+        if use_pretrained:
+            model = self.FORCED_MODEL
+            if requested_model != model:
+                LOGGER.warning(
+                    f"Ignoring requested model '{requested_model}'. This build always uses '{model}'."
+                )
+        else:
+            model = "yolo11n.yaml"
+            LOGGER.info("No model path provided. Building hardcoded YOLO11n with random initialization.")
 
         # Check if Ultralytics HUB model from https://hub.ultralytics.com
         if self.is_hub_model(model):
@@ -145,10 +157,16 @@ class Model(torch.nn.Module):
 
         # Load or create new YOLO model
         __import__("os").environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # to avoid deterministic warnings
-        if str(model).endswith((".yaml", ".yml")):
-            self._new(model, task=task, verbose=verbose)
-        else:
+        if use_pretrained:
             self._load(model, task=task)
+        else:
+            forced_model_cls = self._smart_load("model")
+            self._new(
+                model,
+                task=task,
+                model=lambda cfg_dict, verbose=False: forced_model_cls(cfg_dict, verbose=verbose, pretrained=False),
+                verbose=verbose,
+            )
 
         # Delete super().training for accessing self.model.training
         del self.training

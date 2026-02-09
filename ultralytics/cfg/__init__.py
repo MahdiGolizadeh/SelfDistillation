@@ -919,11 +919,15 @@ def entrypoint(debug: str = "") -> None:
         if "model" not in overrides:
             overrides["model"] = TASK2MODEL[task]
 
-    # Model
-    model = overrides.pop("model", DEFAULT_CFG.model)
-    if model is None:
-        model = "yolo11n.pt"
+    # Model (forced)
+    requested_model = overrides.pop("model", DEFAULT_CFG.model)
+    model = "yolo11n.pt"
+    if requested_model is None:
         LOGGER.warning(f"'model' argument is missing. Using default 'model={model}'.")
+    elif requested_model != model:
+        LOGGER.warning(f"Ignoring requested model '{requested_model}'. This build always uses '{model}'.")
+
+
     overrides["model"] = model
     stem = Path(model).stem.lower()
     if "rtdetr" in stem:  # guess architecture

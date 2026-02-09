@@ -42,7 +42,7 @@ class YOLO(Model):
         >>> model = YOLO("yolo11n.yaml")
     """
 
-    def __init__(self, model: Union[str, Path] = "yolo11n.pt", task: Optional[str] = None, verbose: bool = False):
+    def __init__(self, model: Union[str, Path, None] = None, task: Optional[str] = None, verbose: bool = False):
         """
         Initialize a YOLO model.
 
@@ -50,7 +50,7 @@ class YOLO(Model):
         (YOLOWorld or YOLOE) based on the model filename.
 
         Args:
-            model (str | Path): Model name or path to model file, i.e. 'yolo11n.pt', 'yolo11n.yaml'.
+            model (str | Path | None): Model name/path to load pretrained checkpoint. Use None/empty to build random-init model.
             task (str, optional): YOLO task specification, i.e. 'detect', 'segment', 'classify', 'pose', 'obb'.
                 Defaults to auto-detection based on model.
             verbose (bool): Display model info on load.

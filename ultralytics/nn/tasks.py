@@ -370,8 +370,8 @@ class DetectionModel(BaseModel):
         >>> model = DetectionModel("yolo11n.yaml", ch=3, nc=80)
         >>> results = model.predict(image_tensor)
     """
-
-    def __init__(self, cfg="yolo11n.yaml", ch=3, nc=None, verbose=True):
+    FORCED_WEIGHTS = "yolo11n.pt"
+    def __init__(self, cfg="yolo11n.yaml", ch=3, nc=None, verbose=True, pretrained=True):
         """
         Initialize the YOLO detection model with the given config and parameters.
 
@@ -380,52 +380,97 @@ class DetectionModel(BaseModel):
             ch (int): Number of input channels.
             nc (int, optional): Number of classes.
             verbose (bool): Whether to display model information.
+            pretrained (bool): If True, load forced pretrained YOLO11n weights after building.
         """
         super().__init__()
-        self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)  # cfg dict
-        if self.yaml["backbone"][0][2] == "Silence":
+        if isinstance(cfg, dict) or str(cfg) not in {"yolo11n.yaml", self.FORCED_WEIGHTS}:
             LOGGER.warning(
-                "YOLOv9 `Silence` module is deprecated in favor of torch.nn.Identity. "
-                "Please delete local *.pt file and re-download the latest model checkpoint."
+                f"Ignoring requested detection config '{cfg}'. This build always uses hardcoded YOLO11n architecture."
             )
-            self.yaml["backbone"][0][2] = "nn.Identity"
+        if ch != 3:
+            LOGGER.warning(f"Ignoring requested input channels ch={ch}. This build always uses ch=3.")
+        if nc not in (None, 80):
+            LOGGER.warning(f"Ignoring requested class count nc={nc}. This build always uses nc=80.")
 
-        # Define model
-        self.yaml["channels"] = ch  # save channels
-        if nc and nc != self.yaml["nc"]:
-            LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
-            self.yaml["nc"] = nc  # override YAML value
-        self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)  # model, savelist
-        self.names = {i: f"{i}" for i in range(self.yaml["nc"])}  # default names dict
-        self.inplace = self.yaml.get("inplace", True)
+        self.yaml = {"nc": 80, "channels": 3, "yaml_file": "hardcoded_yolo11n"}
+        self.model, self.save = self._build_hardcoded_yolo11n()
+        self.names = {i: f"{i}" for i in range(80)}
+        self.inplace = True
         self.end2end = getattr(self.model[-1], "end2end", False)
 
-        # Build strides
-        m = self.model[-1]  # Detect()
-        if isinstance(m, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
-            s = 256  # 2x min stride
+        m = self.model[-1]
+        if isinstance(m, Detect):
+            s = 256
+
             m.inplace = self.inplace
 
             def _forward(x):
-                """Perform a forward pass through the model, handling different Detect subclass types accordingly."""
                 if self.end2end:
                     return self.forward(x)["one2many"]
                 return self.forward(x)[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB)) else self.forward(x)
 
-            self.model.eval()  # Avoid changing batch statistics until training begins
-            m.training = True  # Setting it to True to properly return strides
-            m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # forward
+            self.model.eval()
+            m.training = True
+            m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, 3, s, s))])
             self.stride = m.stride
-            self.model.train()  # Set model back to training(default) mode
-            m.bias_init()  # only run once
+            self.model.train()
+            m.bias_init()
         else:
-            self.stride = torch.Tensor([32])  # default stride for i.e. RTDETR
+            self.stride = torch.Tensor([32])
 
-        # Init weights, biases
         initialize_weights(self)
+
+        if pretrained:
+            pretrained_model, _ = attempt_load_one_weight(self.FORCED_WEIGHTS)
+            self.load(pretrained_model, verbose=verbose)
+            if hasattr(pretrained_model, "stride"):
+                self.stride = pretrained_model.stride.clone()
+        elif verbose:
+            LOGGER.info("Using hardcoded YOLO11n architecture with random initialization (pretrained=False).")
+
         if verbose:
             self.info()
             LOGGER.info("")
+
+    @staticmethod
+    def _build_hardcoded_yolo11n():
+        """Build YOLO11n detection architecture directly as PyTorch modules (no YAML parsing)."""
+        layers = []
+
+        def add(module, f):
+            i = len(layers)
+            module.i = i
+            module.f = f
+            module.type = str(module.__class__.__name__)
+            module.np = sum(x.numel() for x in module.parameters())
+            layers.append(module)
+
+        add(Conv(3, 16, 3, 2), -1)
+        add(Conv(16, 32, 3, 2), -1)
+        add(C3k2(32, 64, 1, False, 0.25), -1)
+        add(Conv(64, 64, 3, 2), -1)
+        add(C3k2(64, 128, 1, False, 0.25), -1)
+        add(Conv(128, 128, 3, 2), -1)
+        add(C3k2(128, 128, 1, True), -1)
+        add(Conv(128, 256, 3, 2), -1)
+        add(C3k2(256, 256, 1, True), -1)
+        add(SPPF(256, 256, 5), -1)
+        add(C2PSA(256, 256, 1), -1)
+        add(nn.Upsample(None, 2, "nearest"), -1)
+        add(Concat(1), [-1, 6])
+        add(C3k2(384, 128, 1, False), -1)
+        add(nn.Upsample(None, 2, "nearest"), -1)
+        add(Concat(1), [-1, 4])
+        add(C3k2(256, 64, 1, False), -1)
+        add(Conv(64, 64, 3, 2), -1)
+        add(Concat(1), [-1, 13])
+        add(C3k2(192, 128, 1, False), -1)
+        add(Conv(128, 128, 3, 2), -1)
+        add(Concat(1), [-1, 10])
+        add(C3k2(384, 256, 1, True), -1)
+        add(Detect(80, (64, 128, 256)), [16, 19, 22])
+
+        return nn.Sequential(*layers), [4, 6, 10, 13, 16, 19, 22]
 
     def _predict_augment(self, x):
         """
