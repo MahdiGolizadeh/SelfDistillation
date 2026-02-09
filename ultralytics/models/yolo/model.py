@@ -9,14 +9,7 @@ from ultralytics.data.build import load_inference_source
 from ultralytics.engine.model import Model
 from ultralytics.models import yolo
 from ultralytics.nn.tasks import (
-    ClassificationModel,
     DetectionModel,
-    OBBModel,
-    PoseModel,
-    SegmentationModel,
-    WorldModel,
-    YOLOEModel,
-    YOLOESegModel,
 )
 from ultralytics.utils import ROOT, YAML
 
