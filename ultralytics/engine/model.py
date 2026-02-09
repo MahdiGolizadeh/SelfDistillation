@@ -160,6 +160,8 @@ class Model(torch.nn.Module):
         if use_pretrained:
             self._load(model, task=task)
         else:
+            if self.task is None:
+                self.task = guess_model_task(model) or "detect"
             forced_model_cls = self._smart_load("model")
             self._new(
                 model,
