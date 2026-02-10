@@ -189,13 +189,22 @@ class BaseModel(torch.nn.Module):
         return x
 
     def _apply_active_channel_mask(self, x):
-        """Mask channels above the active ratio for slimmable-style subnet training."""
-        ratio = float(getattr(self, "_active_channel_ratio", 1.0))
-        if ratio >= 1.0 or not isinstance(x, torch.Tensor) or x.ndim < 2:
+        """Mask channels for slimmable-style subnet training using ratio or divisor."""
+        spec = getattr(self, "_active_channel_ratio", 1.0)
+        if not isinstance(x, torch.Tensor) or x.ndim < 2:
             return x
 
         channels = x.shape[1]
-        keep = max(1, min(channels, int(round(channels * ratio))))
+        keep = channels
+        if isinstance(spec, (int, float)) and float(spec).is_integer() and float(spec) > 1:
+            # Integer mode: `spec=3` means keep `channels // 3` channels.
+            keep = max(1, channels // int(spec))
+        else:
+            ratio = float(spec)
+            if ratio >= 1.0:
+                return x
+            keep = max(1, min(channels, int(round(channels * ratio))))
+
         if keep >= channels:
             return x
 
@@ -205,9 +214,9 @@ class BaseModel(torch.nn.Module):
 
     @contextlib.contextmanager
     def active_channel_ratio(self, ratio=1.0):
-        """Temporarily set active output-channel ratio used during forward passes."""
-        prev = float(getattr(self, "_active_channel_ratio", 1.0))
-        self._active_channel_ratio = float(ratio)
+        """Temporarily set active output-channel ratio/divisor used during forward passes."""
+        prev = getattr(self, "_active_channel_ratio", 1.0)
+        self._active_channel_ratio = ratio
         try:
             yield
         finally:
@@ -404,7 +413,7 @@ class DetectionModel(BaseModel):
         nc=None,
         verbose=True,
         pretrained=True,
-        dual_channel_ratio=None,
+        dual_channel_ratio=3,
         dual_channel_loss_weight=1.0,
     ):
 
@@ -537,6 +546,55 @@ class DetectionModel(BaseModel):
             y.append(yi)
         y = self._clip_augmented(y)  # clip augmented tails
         return torch.cat(y, -1), None  # augmented inference, train
+
+    @staticmethod
+    def _parse_dual_channel_ratio(ratio):
+        """Parse subnet spec as ratio (<1) or divisor integer (>1)."""
+        if ratio is None:
+            return None
+        if isinstance(ratio, int):
+            return ratio
+        if isinstance(ratio, float):
+            return int(ratio) if ratio.is_integer() else ratio
+        text = str(ratio).strip()
+        if "/" in text:
+            num, den = text.split("/", 1)
+            return float(num.strip()) / float(den.strip())
+        value = float(text)
+        return int(value) if value.is_integer() else value
+
+    def loss(self, batch, preds=None):
+        """Compute standard or dual-channel (subnet + full-net) detection loss."""
+        if getattr(self, "criterion", None) is None:
+            self.criterion = self.init_criterion()
+
+        ratio = self._parse_dual_channel_ratio(self.dual_channel_ratio)
+        ratio_is_fraction = isinstance(ratio, float) and 0.0 < ratio < 1.0
+        ratio_is_divisor = isinstance(ratio, int) and ratio > 1
+        use_dual = (
+            preds is None
+            and self.training
+            and ratio is not None
+            and (ratio_is_fraction or ratio_is_divisor)
+            and float(self.dual_channel_loss_weight) > 0.0
+        )
+        if not use_dual:
+            preds = self.forward(batch["img"]) if preds is None else preds
+            return self.criterion(preds, batch)
+
+        # 1) Subnet pass (e.g. ratio=1/3 keeps first 16 of 48 channels in stem conv).
+        with self.active_channel_ratio(ratio):
+            preds_subnet = self.forward(batch["img"])
+        loss_subnet, items_subnet = self.criterion(preds_subnet, batch)
+
+        # 2) Full-net pass. Shared channels receive gradients from both passes.
+        with self.active_channel_ratio(1.0):
+            preds_full = self.forward(batch["img"])
+        loss_full, items_full = self.criterion(preds_full, batch)
+
+        alpha = float(self.dual_channel_loss_weight)
+        train_items = torch.cat((items_full, items_subnet))
+        return loss_full + alpha * loss_subnet, train_items
 
     def loss(self, batch, preds=None):
         """Compute standard or dual-channel (subnet + full-net) detection loss."""

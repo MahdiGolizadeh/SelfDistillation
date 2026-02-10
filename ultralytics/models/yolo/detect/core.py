@@ -19,6 +19,25 @@ from ultralytics.utils.torch_utils import de_parallel, torch_distributed_zero_fi
 
 
 class DetectionTrainer(BaseTrainer):
+    @staticmethod
+    def _resolve_dual_ratio(value, default=None):
+        """Parse dual channel spec as ratio (<1) or divisor integer (>1)."""
+        if value is None:
+            return default
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value) if value.is_integer() else value
+
+        text = str(value).strip()
+        if not text:
+            return default
+        if "/" in text:
+            num, den = text.split("/", 1)
+            return float(num.strip()) / float(den.strip())
+        parsed = float(text)
+        return int(parsed) if parsed.is_integer() else parsed
+
     """
     A class extending the BaseTrainer class for training based on a detection model.
 
@@ -140,12 +159,17 @@ class DetectionTrainer(BaseTrainer):
             (DetectionModel): YOLO detection model.
         """
         use_pretrained = bool(self.args.pretrained)
+        dual_ratio = self._resolve_dual_ratio(getattr(self.args, "dual_channel_ratio", None), default=3)
+        if dual_ratio is None:
+            dual_ratio = 1.0 / 3.0
         model = DetectionModel(
             cfg,
             nc=self.data["nc"],
             ch=self.data["channels"],
             verbose=verbose and RANK == -1,
             pretrained=use_pretrained,
+            dual_channel_ratio=dual_ratio,
+            dual_channel_loss_weight=getattr(self.args, "dual_channel_loss_weight", 1.0),
         )
 
         if weights:
@@ -155,6 +179,24 @@ class DetectionTrainer(BaseTrainer):
     def get_validator(self):
         """Return a DetectionValidator for YOLO model validation."""
         self.loss_names = "box_loss", "cls_loss", "dfl_loss"
+        model_dual_ratio = getattr(de_parallel(self.model), "dual_channel_ratio", None) if self.model else None
+        dual_ratio = self._resolve_dual_ratio(
+            getattr(self.args, "dual_channel_ratio", model_dual_ratio),
+            default=self._resolve_dual_ratio(model_dual_ratio, default=3),
+        )
+        dual_fraction = isinstance(dual_ratio, float) and 0.0 < dual_ratio < 1.0
+        dual_divisor = isinstance(dual_ratio, int) and dual_ratio > 1
+        if dual_fraction or dual_divisor:
+            self.train_loss_names = (
+                "teacher_box_loss",
+                "teacher_cls_loss",
+                "teacher_dfl_loss",
+                "student_box_loss",
+                "student_cls_loss",
+                "student_dfl_loss",
+            )
+        else:
+            self.train_loss_names = self.loss_names
         return yolo.detect.DetectionValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )
@@ -170,7 +212,9 @@ class DetectionTrainer(BaseTrainer):
         Returns:
             (Dict | List): Dictionary of labeled loss items if loss_items is provided, otherwise list of keys.
         """
-        keys = [f"{prefix}/{x}" for x in self.loss_names]
+        names = self.train_loss_names if prefix == "train" else self.loss_names
+        keys = [f"{prefix}/{x}" for x in names]
+
         if loss_items is not None:
             loss_items = [round(float(x), 5) for x in loss_items]  # convert tensors to 5 decimal place floats
             return dict(zip(keys, loss_items))
@@ -179,13 +223,15 @@ class DetectionTrainer(BaseTrainer):
 
     def progress_string(self):
         """Return a formatted string of training progress with epoch, GPU memory, loss, instances and size."""
-        return ("\n" + "%11s" * (4 + len(self.loss_names))) % (
+        names = getattr(self, "train_loss_names", self.loss_names)
+        return ("\n" + "%11s" * (4 + len(names))) % (
             "Epoch",
             "GPU_mem",
-            *self.loss_names,
+            *names,
             "Instances",
             "Size",
         )
+
 
     def plot_training_samples(self, batch: Dict[str, Any], ni: int) -> None:
         """

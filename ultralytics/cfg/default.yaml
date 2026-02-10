@@ -37,6 +37,8 @@ fraction: 1.0 # (float) dataset fraction to train on (default is 1.0, all images
 profile: False # (bool) profile ONNX and TensorRT speeds during training for loggers
 freeze: # (int | list, optional) freeze first n layers, or freeze list of layer indices during training
 multi_scale: False # (bool) Whether to use multiscale during training
+dual_channel_ratio: 3 # (int | float | str) student subnet spec: int divisor (3=>channels/3) or ratio (<1)
+dual_channel_loss_weight: 1.0 # (float) weight for student loss when using dual-channel training
 # Segmentation
 overlap_mask: True # (bool) merge object masks into a single image mask during training (segment train only)
 mask_ratio: 4 # (int) mask downsample ratio (segment train only)
