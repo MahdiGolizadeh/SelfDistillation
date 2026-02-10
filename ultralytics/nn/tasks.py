@@ -178,6 +178,7 @@ class BaseModel(torch.nn.Module):
             if profile:
                 self._profile_one_layer(m, x, dt)
             x = m(x)  # run
+            x = self._apply_active_channel_mask(x)
             y.append(x if m.i in self.save else None)  # save output
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
@@ -186,6 +187,31 @@ class BaseModel(torch.nn.Module):
                 if m.i == max_idx:
                     return torch.unbind(torch.cat(embeddings, 1), dim=0)
         return x
+
+    def _apply_active_channel_mask(self, x):
+        """Mask channels above the active ratio for slimmable-style subnet training."""
+        ratio = float(getattr(self, "_active_channel_ratio", 1.0))
+        if ratio >= 1.0 or not isinstance(x, torch.Tensor) or x.ndim < 2:
+            return x
+
+        channels = x.shape[1]
+        keep = max(1, min(channels, int(round(channels * ratio))))
+        if keep >= channels:
+            return x
+
+        masked = x.clone()
+        masked[:, keep:] = 0
+        return masked
+
+    @contextlib.contextmanager
+    def active_channel_ratio(self, ratio=1.0):
+        """Temporarily set active output-channel ratio used during forward passes."""
+        prev = float(getattr(self, "_active_channel_ratio", 1.0))
+        self._active_channel_ratio = float(ratio)
+        try:
+            yield
+        finally:
+            self._active_channel_ratio = prev
 
     def _predict_augment(self, x):
         """Perform augmentations on input image x and return augmented inference."""
@@ -371,7 +397,17 @@ class DetectionModel(BaseModel):
         >>> results = model.predict(image_tensor)
     """
     FORCED_WEIGHTS = "yolo11n.pt"
-    def __init__(self, cfg="yolo11n.yaml", ch=3, nc=None, verbose=True, pretrained=True):
+    def __init__(
+        self,
+        cfg="yolo11n.yaml",
+        ch=3,
+        nc=None,
+        verbose=True,
+        pretrained=True,
+        dual_channel_ratio=None,
+        dual_channel_loss_weight=1.0,
+    ):
+
         """
         Initialize the YOLO detection model with the given config and parameters.
 
@@ -381,6 +417,9 @@ class DetectionModel(BaseModel):
             nc (int, optional): Number of classes.
             verbose (bool): Whether to display model information.
             pretrained (bool): If True, load forced pretrained YOLO11n weights after building.
+            dual_channel_ratio (float, optional): If set in (0, 1), also train with a masked channel subnet.
+            dual_channel_loss_weight (float): Weight for the masked subnet loss contribution.
+
         """
         super().__init__()
         if isinstance(cfg, dict) or str(cfg) not in {"yolo11n.yaml", self.FORCED_WEIGHTS}:
@@ -394,6 +433,8 @@ class DetectionModel(BaseModel):
         self.yaml = {"nc": model_nc, "channels": 3, "yaml_file": "hardcoded_yolo11n"}
         self.model, self.save = self._build_hardcoded_yolo11n(model_nc)
         self.names = {i: f"{i}" for i in range(model_nc)}
+        self.dual_channel_ratio = dual_channel_ratio
+        self.dual_channel_loss_weight = dual_channel_loss_weight
 
         self.inplace = True
         self.end2end = getattr(self.model[-1], "end2end", False)
@@ -496,6 +537,36 @@ class DetectionModel(BaseModel):
             y.append(yi)
         y = self._clip_augmented(y)  # clip augmented tails
         return torch.cat(y, -1), None  # augmented inference, train
+
+    def loss(self, batch, preds=None):
+        """Compute standard or dual-channel (subnet + full-net) detection loss."""
+        if getattr(self, "criterion", None) is None:
+            self.criterion = self.init_criterion()
+
+        ratio = self.dual_channel_ratio
+        use_dual = (
+            preds is None
+            and self.training
+            and ratio is not None
+            and 0.0 < float(ratio) < 1.0
+            and float(self.dual_channel_loss_weight) > 0.0
+        )
+        if not use_dual:
+            preds = self.forward(batch["img"]) if preds is None else preds
+            return self.criterion(preds, batch)
+
+        # 1) Subnet pass (e.g. ratio=1/3 keeps first 16 of 48 channels in stem conv).
+        with self.active_channel_ratio(float(ratio)):
+            preds_subnet = self.forward(batch["img"])
+        loss_subnet, items_subnet = self.criterion(preds_subnet, batch)
+
+        # 2) Full-net pass. Shared channels receive gradients from both passes.
+        with self.active_channel_ratio(1.0):
+            preds_full = self.forward(batch["img"])
+        loss_full, items_full = self.criterion(preds_full, batch)
+
+        alpha = float(self.dual_channel_loss_weight)
+        return loss_full + alpha * loss_subnet, items_full + alpha * items_subnet
 
     @staticmethod
     def _descale_pred(p, flips, scale, img_size, dim=1):
