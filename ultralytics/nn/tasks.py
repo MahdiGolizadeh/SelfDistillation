@@ -389,12 +389,12 @@ class DetectionModel(BaseModel):
             )
         if ch != 3:
             LOGGER.warning(f"Ignoring requested input channels ch={ch}. This build always uses ch=3.")
-        if nc not in (None, 80):
-            LOGGER.warning(f"Ignoring requested class count nc={nc}. This build always uses nc=80.")
+        model_nc = nc if nc is not None else 80
 
-        self.yaml = {"nc": 80, "channels": 3, "yaml_file": "hardcoded_yolo11n"}
-        self.model, self.save = self._build_hardcoded_yolo11n()
-        self.names = {i: f"{i}" for i in range(80)}
+        self.yaml = {"nc": model_nc, "channels": 3, "yaml_file": "hardcoded_yolo11n"}
+        self.model, self.save = self._build_hardcoded_yolo11n(model_nc)
+        self.names = {i: f"{i}" for i in range(model_nc)}
+
         self.inplace = True
         self.end2end = getattr(self.model[-1], "end2end", False)
 
@@ -433,7 +433,7 @@ class DetectionModel(BaseModel):
             LOGGER.info("")
 
     @staticmethod
-    def _build_hardcoded_yolo11n():
+    def _build_hardcoded_yolo11n(nc=80):
         """Build YOLO11n detection architecture directly as PyTorch modules (no YAML parsing)."""
         layers = []
 
@@ -468,7 +468,7 @@ class DetectionModel(BaseModel):
         add(Conv(128, 128, 3, 2), -1)
         add(Concat(1), [-1, 10])
         add(C3k2(384, 256, 1, True), -1)
-        add(Detect(80, (64, 128, 256)), [16, 19, 22])
+        add(Detect(nc, (64, 128, 256)), [16, 19, 22])
 
         return nn.Sequential(*layers), [4, 6, 10, 13, 16, 19, 22]
 
