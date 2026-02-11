@@ -486,6 +486,8 @@ class DetectionModel(BaseModel):
         pretrained=True,
         dual_channel_ratio=3,
         dual_channel_loss_weight=1.0,
+        channel_scale=1.0,
+        use_dual_bn=True,
     ):
 
         """
@@ -499,10 +501,14 @@ class DetectionModel(BaseModel):
             pretrained (bool): If True, load forced pretrained YOLO11n weights after building.
             dual_channel_ratio (float, optional): If set in (0, 1), also train with a masked channel subnet.
             dual_channel_loss_weight (float): Weight for the masked subnet loss contribution.
-
+            channel_scale (float): Global channel scaling factor for building a compact network.
+            use_dual_bn (bool): If True, replace BatchNorm with dual BN (full/subnet stats).
         """
         super().__init__()
-        if isinstance(cfg, dict) or str(cfg) not in {"yolo11n.yaml", self.FORCED_WEIGHTS}:
+        cfg_ok = str(cfg) in {"yolo11n.yaml", self.FORCED_WEIGHTS}
+        if isinstance(cfg, dict):
+            cfg_ok = cfg.get("yaml_file") in {"hardcoded_yolo11n", "yolo11n.yaml"}
+        if not cfg_ok:
             LOGGER.warning(
                 f"Ignoring requested detection config '{cfg}'. This build always uses hardcoded YOLO11n architecture."
             )
@@ -511,7 +517,7 @@ class DetectionModel(BaseModel):
         model_nc = nc if nc is not None else 80
 
         self.yaml = {"nc": model_nc, "channels": 3, "yaml_file": "hardcoded_yolo11n"}
-        self.model, self.save = self._build_hardcoded_yolo11n(model_nc)
+        self.model, self.save = self._build_hardcoded_yolo11n(model_nc, width_mult=channel_scale)
         self.names = {i: f"{i}" for i in range(model_nc)}
         self.dual_channel_ratio = dual_channel_ratio
         self.dual_channel_loss_weight = dual_channel_loss_weight
@@ -549,8 +555,9 @@ class DetectionModel(BaseModel):
         elif verbose:
             LOGGER.info("Using hardcoded YOLO11n architecture with random initialization (pretrained=False).")
 
-        self._replace_batchnorm_with_dual()
-        self._set_dual_bn_mode("full")
+        if use_dual_bn:
+            self._replace_batchnorm_with_dual()
+            self._set_dual_bn_mode("full")
 
         if verbose:
             self.info()
@@ -567,9 +574,12 @@ class DetectionModel(BaseModel):
                     setattr(module, name, DualBatchNorm2d.from_batchnorm(child))
 
     @staticmethod
-    def _build_hardcoded_yolo11n(nc=80):
+    def _build_hardcoded_yolo11n(nc=80, width_mult=1.0):
         """Build YOLO11n detection architecture directly as PyTorch modules (no YAML parsing)."""
         layers = []
+
+        def c(ch):
+            return max(1, int(round(ch * float(width_mult))))
 
         def add(module, f):
             i = len(layers)
@@ -579,30 +589,30 @@ class DetectionModel(BaseModel):
             module.np = sum(x.numel() for x in module.parameters())
             layers.append(module)
 
-        add(Conv(3, 48, 3, 2), -1)
-        add(Conv(48, 96, 3, 2), -1)
-        add(C3k2(96, 192, 1, False, 0.25), -1)
-        add(Conv(192, 192, 3, 2), -1)
-        add(C3k2(192, 384, 1, False, 0.25), -1)
-        add(Conv(384, 384, 3, 2), -1)
-        add(C3k2(384, 384, 1, True), -1)
-        add(Conv(384, 768, 3, 2), -1)
-        add(C3k2(768, 768, 1, True), -1)
-        add(SPPF(768, 768, 5), -1)
-        add(C2PSA(768, 768, 1), -1)
+        add(Conv(3, c(48), 3, 2), -1)
+        add(Conv(c(48), c(96), 3, 2), -1)
+        add(C3k2(c(96), c(192), 1, False, 0.25), -1)
+        add(Conv(c(192), c(192), 3, 2), -1)
+        add(C3k2(c(192), c(384), 1, False, 0.25), -1)
+        add(Conv(c(384), c(384), 3, 2), -1)
+        add(C3k2(c(384), c(384), 1, True), -1)
+        add(Conv(c(384), c(768), 3, 2), -1)
+        add(C3k2(c(768), c(768), 1, True), -1)
+        add(SPPF(c(768), c(768), 5), -1)
+        add(C2PSA(c(768), c(768), 1), -1)
         add(nn.Upsample(None, 2, "nearest"), -1)
         add(Concat(1), [-1, 6])
-        add(C3k2(1152, 384, 1, False), -1)
+        add(C3k2(c(1152), c(384), 1, False), -1)
         add(nn.Upsample(None, 2, "nearest"), -1)
         add(Concat(1), [-1, 4])
-        add(C3k2(768, 192, 1, False), -1)
-        add(Conv(192, 192, 3, 2), -1)
+        add(C3k2(c(768), c(192), 1, False), -1)
+        add(Conv(c(192), c(192), 3, 2), -1)
         add(Concat(1), [-1, 13])
-        add(C3k2(576, 384, 1, False), -1)
-        add(Conv(384, 384, 3, 2), -1)
+        add(C3k2(c(576), c(384), 1, False), -1)
+        add(Conv(c(384), c(384), 3, 2), -1)
         add(Concat(1), [-1, 10])
-        add(C3k2(1152, 768, 1, True), -1)
-        add(Detect(nc, (192, 384, 768)), [16, 19, 22])
+        add(C3k2(c(1152), c(768), 1, True), -1)
+        add(Detect(nc, (c(192), c(384), c(768))), [16, 19, 22])
 
         return nn.Sequential(*layers), [4, 6, 10, 13, 16, 19, 22]
 

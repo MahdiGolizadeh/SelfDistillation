@@ -3,6 +3,7 @@
 import math
 import random
 from copy import copy
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -200,6 +201,90 @@ class DetectionTrainer(BaseTrainer):
         return yolo.detect.DetectionValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )
+
+    def save_model(self):
+        """Save standard checkpoints and extra standalone student/subnet checkpoints when dual training is enabled."""
+        super().save_model()
+
+        dual_ratio = self._resolve_dual_ratio(getattr(self.args, "dual_channel_ratio", None), default=None)
+        dual_active = dual_ratio is not None and (
+            (isinstance(dual_ratio, float) and 0.0 < dual_ratio < 1.0) or (isinstance(dual_ratio, int) and dual_ratio > 1)
+        )
+        if not dual_active or not self.ema:
+            return
+
+        import io
+        from copy import deepcopy
+
+        student_ema = deepcopy(self.ema.ema).float()
+        if hasattr(student_ema, "_set_dual_bn_mode"):
+            student_ema._set_dual_bn_mode("subnet")
+
+        if isinstance(dual_ratio, int) and dual_ratio > 1:
+            channel_scale = 1.0 / float(dual_ratio)
+        elif isinstance(dual_ratio, float) and 0.0 < dual_ratio < 1.0:
+            channel_scale = float(dual_ratio)
+        else:
+            channel_scale = 1.0
+
+        compact_student = DetectionModel(
+            cfg="yolo11n.yaml",
+            ch=self.data["channels"],
+            nc=self.data["nc"],
+            verbose=False,
+            pretrained=False,
+            dual_channel_ratio=1.0,
+            dual_channel_loss_weight=0.0,
+            channel_scale=channel_scale,
+            use_dual_bn=False,
+        ).float()
+        self._copy_compact_student_weights(student_ema, compact_student)
+        compact_student = compact_student.half()
+
+        buffer = io.BytesIO()
+        torch.save(
+            {
+                "epoch": self.epoch,
+                "best_fitness": self.best_fitness,
+                "model": None,
+                "ema": compact_student,
+                "updates": self.ema.updates,
+                "optimizer": None,
+                "train_args": vars(self.args),
+                "train_metrics": {**self.metrics, **{"fitness": self.fitness}},
+                "date": datetime.now().isoformat(),
+            },
+            buffer,
+        )
+        serialized_ckpt = buffer.getvalue()
+
+        student_last = self.wdir / "last_student.pt"
+        student_best = self.wdir / "best_student.pt"
+        student_last.write_bytes(serialized_ckpt)
+        if self.best_fitness == self.fitness:
+            student_best.write_bytes(serialized_ckpt)
+        if (self.save_period > 0) and (self.epoch % self.save_period == 0):
+            (self.wdir / f"epoch{self.epoch}_student.pt").write_bytes(serialized_ckpt)
+
+    @staticmethod
+    def _copy_compact_student_weights(src_model, dst_model):
+        """Copy weights from full subnet-trained model into compact student model by channel-prefix slicing."""
+        src_state = src_model.state_dict()
+        dst_state = dst_model.state_dict()
+        loaded = {}
+        for k, dst_v in dst_state.items():
+            src_v = src_state.get(k)
+            if src_v is None:
+                continue
+            if src_v.shape == dst_v.shape:
+                loaded[k] = src_v
+                continue
+            if src_v.ndim != dst_v.ndim or any(d > s for d, s in zip(dst_v.shape, src_v.shape)):
+                continue
+            slices = tuple(slice(0, d) for d in dst_v.shape)
+            loaded[k] = src_v[slices]
+        dst_state.update(loaded)
+        dst_model.load_state_dict(dst_state, strict=False)
 
     def label_loss_items(self, loss_items: Optional[List[float]] = None, prefix: str = "train"):
         """
@@ -459,6 +544,60 @@ class DetectionValidator(BaseValidator):
         self.iouv = torch.linspace(0.5, 0.95, 10)  # IoU vector for mAP@0.5:0.95
         self.niou = self.iouv.numel()
         self.metrics = DetMetrics()
+
+    @staticmethod
+    def _resolve_dual_ratio(value, default=None):
+        """Parse dual channel spec as ratio (<1) or divisor integer (>1)."""
+        if value is None:
+            return default
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value) if value.is_integer() else value
+        text = str(value).strip()
+        if not text:
+            return default
+        if "/" in text:
+            num, den = text.split("/", 1)
+            return float(num.strip()) / float(den.strip())
+        value = float(text)
+        return int(value) if value.is_integer() else value
+
+    def __call__(self, trainer=None, model=None):
+        """Run standard validation and, during dual training, also report subnet/student metrics."""
+        full_stats = super().__call__(trainer=trainer, model=model)
+        if trainer is None:
+            return full_stats
+
+        model_ref = trainer.ema.ema or trainer.model
+        model_dual_ratio = getattr(de_parallel(model_ref), "dual_channel_ratio", None)
+        dual_ratio = self._resolve_dual_ratio(getattr(trainer.args, "dual_channel_ratio", model_dual_ratio), default=None)
+        dual_active = dual_ratio is not None and (
+            (isinstance(dual_ratio, float) and 0.0 < dual_ratio < 1.0) or (isinstance(dual_ratio, int) and dual_ratio > 1)
+        )
+        if not dual_active or not hasattr(model_ref, "active_channel_ratio"):
+            return full_stats
+
+        plots, save_json = self.args.plots, self.args.save_json
+        self.args.plots, self.args.save_json = False, False
+        try:
+            with model_ref.active_bn_mode("subnet"):
+                with model_ref.active_channel_ratio(dual_ratio):
+                    subnet_stats = super().__call__(trainer=trainer, model=model)
+        finally:
+            self.args.plots, self.args.save_json = plots, save_json
+
+        student_stats = {
+            k.replace("metrics/", "metrics_student/", 1): v for k, v in subnet_stats.items() if k.startswith("metrics/")
+        }
+        LOGGER.info(
+            "Student subnet metrics: "
+            f"P={student_stats.get('metrics_student/precision(B)', 0):.4f}, "
+            f"R={student_stats.get('metrics_student/recall(B)', 0):.4f}, "
+            f"mAP50={student_stats.get('metrics_student/mAP50(B)', 0):.4f}, "
+            f"mAP50-95={student_stats.get('metrics_student/mAP50-95(B)', 0):.4f}"
+        )
+        return {**full_stats, **student_stats}
 
     def preprocess(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         """
