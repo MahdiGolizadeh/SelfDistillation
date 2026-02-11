@@ -558,7 +558,10 @@ class DetectionModel(BaseModel):
             
     def _replace_batchnorm_with_dual(self):
         """Replace every BatchNorm2d with dual BN to keep separate full/subnet running stats."""
-        for module in self.modules():
+        # Snapshot modules first so replacements don't recursively descend into newly created DualBatchNorm2d branches.
+        for module in list(self.modules()):
+            if isinstance(module, DualBatchNorm2d):
+                continue
             for name, child in list(module.named_children()):
                 if isinstance(child, nn.BatchNorm2d):
                     setattr(module, name, DualBatchNorm2d.from_batchnorm(child))
