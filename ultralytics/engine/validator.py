@@ -147,7 +147,8 @@ class BaseValidator:
             self.args.half = self.device.type != "cpu" and trainer.amp
             model = trainer.ema.ema or trainer.model
             model = model.half() if self.args.half else model.float()
-            self.loss = torch.zeros_like(trainer.loss_items, device=trainer.device)
+            n_val_losses = len(trainer.label_loss_items(prefix="val"))
+            self.loss = torch.zeros(n_val_losses, device=trainer.device, dtype=trainer.loss_items.dtype)
             self.args.plots &= trainer.stopper.possible_stop or (trainer.epoch == trainer.epochs - 1)
             model.eval()
         else:
