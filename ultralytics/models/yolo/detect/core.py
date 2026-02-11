@@ -161,7 +161,7 @@ class DetectionTrainer(BaseTrainer):
         use_pretrained = bool(self.args.pretrained)
         dual_ratio = self._resolve_dual_ratio(getattr(self.args, "dual_channel_ratio", None), default=3)
         if dual_ratio is None:
-            dual_ratio = 1.0 / 3.0
+            dual_ratio = 3
         model = DetectionModel(
             cfg,
             nc=self.data["nc"],

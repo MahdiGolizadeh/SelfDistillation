@@ -190,7 +190,7 @@ class BaseModel(torch.nn.Module):
 
     def _apply_active_channel_mask(self, x):
         """Mask channels for slimmable-style subnet training using ratio or divisor."""
-        spec = getattr(self, "_active_channel_ratio", 1.0)
+        spec = getattr(self, "_active_channel_ratio", 3.0)
         if not isinstance(x, torch.Tensor) or x.ndim < 2:
             return x
 
@@ -215,7 +215,7 @@ class BaseModel(torch.nn.Module):
     @contextlib.contextmanager
     def active_channel_ratio(self, ratio=1.0):
         """Temporarily set active output-channel ratio/divisor used during forward passes."""
-        prev = getattr(self, "_active_channel_ratio", 1.0)
+        prev = getattr(self, "_active_channel_ratio", 3.0)
         self._active_channel_ratio = ratio
         try:
             yield
@@ -570,7 +570,7 @@ class DetectionModel(BaseModel):
 
         ratio = self._parse_dual_channel_ratio(self.dual_channel_ratio)
         ratio_is_fraction = isinstance(ratio, float) and 0.0 < ratio < 1.0
-        ratio_is_divisor = isinstance(ratio, int) and ratio > 1
+        ratio_is_divisor = ratio > 1
         use_dual = (
             preds is None
             and self.training
@@ -595,36 +595,6 @@ class DetectionModel(BaseModel):
         alpha = float(self.dual_channel_loss_weight)
         train_items = torch.cat((items_full, items_subnet))
         return loss_full + alpha * loss_subnet, train_items
-
-    def loss(self, batch, preds=None):
-        """Compute standard or dual-channel (subnet + full-net) detection loss."""
-        if getattr(self, "criterion", None) is None:
-            self.criterion = self.init_criterion()
-
-        ratio = self.dual_channel_ratio
-        use_dual = (
-            preds is None
-            and self.training
-            and ratio is not None
-            and 0.0 < float(ratio) < 1.0
-            and float(self.dual_channel_loss_weight) > 0.0
-        )
-        if not use_dual:
-            preds = self.forward(batch["img"]) if preds is None else preds
-            return self.criterion(preds, batch)
-
-        # 1) Subnet pass (e.g. ratio=1/3 keeps first 16 of 48 channels in stem conv).
-        with self.active_channel_ratio(float(ratio)):
-            preds_subnet = self.forward(batch["img"])
-        loss_subnet, items_subnet = self.criterion(preds_subnet, batch)
-
-        # 2) Full-net pass. Shared channels receive gradients from both passes.
-        with self.active_channel_ratio(1.0):
-            preds_full = self.forward(batch["img"])
-        loss_full, items_full = self.criterion(preds_full, batch)
-
-        alpha = float(self.dual_channel_loss_weight)
-        return loss_full + alpha * loss_subnet, items_full + alpha * items_subnet
 
     @staticmethod
     def _descale_pred(p, flips, scale, img_size, dim=1):
