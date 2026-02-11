@@ -93,6 +93,59 @@ from ultralytics.utils.torch_utils import (
     time_sync,
 )
 
+class DualBatchNorm2d(nn.Module):
+    """BatchNorm2d wrapper with independent running stats for full-net and subnet passes."""
+
+    def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True):
+        super().__init__()
+        self.bn_full = nn.BatchNorm2d(num_features, eps, momentum, affine, track_running_stats)
+        self.bn_subnet = nn.BatchNorm2d(num_features, eps, momentum, affine, track_running_stats)
+        self.mode = "full"
+
+    @classmethod
+    def from_batchnorm(cls, bn):
+        """Create dual BN from an existing BatchNorm2d, cloning weights/stats to both branches."""
+        dual = cls(
+            bn.num_features,
+            eps=bn.eps,
+            momentum=bn.momentum,
+            affine=bn.affine,
+            track_running_stats=bn.track_running_stats,
+        )
+        dual.bn_full.load_state_dict(bn.state_dict())
+        dual.bn_subnet.load_state_dict(bn.state_dict())
+        return dual
+
+    def set_mode(self, mode="full"):
+        self.mode = "subnet" if mode == "subnet" else "full"
+
+    @property
+    def active_bn(self):
+        return self.bn_subnet if self.mode == "subnet" else self.bn_full
+
+    def forward(self, x):
+        return self.active_bn(x)
+
+    # Compatibility attrs used by fuse helpers that expect a BatchNorm-like object.
+    @property
+    def weight(self):
+        return self.bn_full.weight
+
+    @property
+    def bias(self):
+        return self.bn_full.bias
+
+    @property
+    def running_mean(self):
+        return self.bn_full.running_mean
+
+    @property
+    def running_var(self):
+        return self.bn_full.running_var
+
+    @property
+    def eps(self):
+        return self.bn_full.eps
 
 class BaseModel(torch.nn.Module):
     """
@@ -221,6 +274,24 @@ class BaseModel(torch.nn.Module):
             yield
         finally:
             self._active_channel_ratio = prev
+
+    @contextlib.contextmanager
+    def active_bn_mode(self, mode="full"):
+        """Temporarily switch dual-batchnorm layers between full-net and subnet statistics."""
+        prev = getattr(self, "_active_bn_mode", "full")
+        self._active_bn_mode = mode
+        self._set_dual_bn_mode(mode)
+        try:
+            yield
+        finally:
+            self._active_bn_mode = prev
+            self._set_dual_bn_mode(prev)
+
+    def _set_dual_bn_mode(self, mode="full"):
+        """Propagate active BN mode to all dual-batchnorm layers in the model."""
+        for module in self.modules():
+            if isinstance(module, DualBatchNorm2d):
+                module.set_mode(mode)
 
     def _predict_augment(self, x):
         """Perform augmentations on input image x and return augmented inference."""
@@ -478,9 +549,19 @@ class DetectionModel(BaseModel):
         elif verbose:
             LOGGER.info("Using hardcoded YOLO11n architecture with random initialization (pretrained=False).")
 
+        self._replace_batchnorm_with_dual()
+        self._set_dual_bn_mode("full")
+
         if verbose:
             self.info()
             LOGGER.info("")
+            
+    def _replace_batchnorm_with_dual(self):
+        """Replace every BatchNorm2d with dual BN to keep separate full/subnet running stats."""
+        for module in self.modules():
+            for name, child in list(module.named_children()):
+                if isinstance(child, nn.BatchNorm2d):
+                    setattr(module, name, DualBatchNorm2d.from_batchnorm(child))
 
     @staticmethod
     def _build_hardcoded_yolo11n(nc=80):
@@ -583,13 +664,15 @@ class DetectionModel(BaseModel):
             return self.criterion(preds, batch)
 
         # 1) Subnet pass (e.g. ratio=1/3 keeps first 16 of 48 channels in stem conv).
-        with self.active_channel_ratio(ratio):
-            preds_subnet = self.forward(batch["img"])
+        with self.active_bn_mode("subnet"):
+            with self.active_channel_ratio(ratio):
+                preds_subnet = self.forward(batch["img"])
         loss_subnet, items_subnet = self.criterion(preds_subnet, batch)
 
         # 2) Full-net pass. Shared channels receive gradients from both passes.
-        with self.active_channel_ratio(1.0):
-            preds_full = self.forward(batch["img"])
+        with self.active_bn_mode("full"):
+            with self.active_channel_ratio(1.0):
+                preds_full = self.forward(batch["img"])
         loss_full, items_full = self.criterion(preds_full, batch)
 
         alpha = float(self.dual_channel_loss_weight)
