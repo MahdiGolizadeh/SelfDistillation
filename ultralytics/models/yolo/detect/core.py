@@ -16,10 +16,18 @@ from ultralytics.nn.tasks import DetectionModel
 from ultralytics.utils import LOGGER, RANK
 from ultralytics.utils.patches import override_configs
 from ultralytics.utils.plotting import plot_images, plot_labels, plot_results
-from ultralytics.utils.torch_utils import de_parallel, torch_distributed_zero_first
+from ultralytics.utils.torch_utils import de_parallel, strip_optimizer, torch_distributed_zero_first
 
 
 class DetectionTrainer(BaseTrainer):
+    @staticmethod
+    def _is_dual_active(dual_ratio):
+        """Return True when dual-channel training mode is enabled."""
+        return dual_ratio is not None and (
+            (isinstance(dual_ratio, float) and 0.0 < dual_ratio < 1.0)
+            or (isinstance(dual_ratio, int) and dual_ratio > 1)
+        )
+
     @staticmethod
     def _resolve_dual_ratio(value, default=None):
         """Parse dual channel spec as ratio (<1) or divisor integer (>1)."""
@@ -207,9 +215,7 @@ class DetectionTrainer(BaseTrainer):
         super().save_model()
 
         dual_ratio = self._resolve_dual_ratio(getattr(self.args, "dual_channel_ratio", None), default=None)
-        dual_active = dual_ratio is not None and (
-            (isinstance(dual_ratio, float) and 0.0 < dual_ratio < 1.0) or (isinstance(dual_ratio, int) and dual_ratio > 1)
-        )
+        dual_active = self._is_dual_active(dual_ratio)
         if not dual_active or not self.ema:
             return
 
@@ -265,6 +271,27 @@ class DetectionTrainer(BaseTrainer):
             student_best.write_bytes(serialized_ckpt)
         if (self.save_period > 0) and (self.epoch % self.save_period == 0):
             (self.wdir / f"epoch{self.epoch}_student.pt").write_bytes(serialized_ckpt)
+
+    def final_eval(self):
+        """Run final evaluation for teacher checkpoints and, if enabled, for student checkpoints too."""
+        super().final_eval()
+
+        dual_ratio = self._resolve_dual_ratio(getattr(self.args, "dual_channel_ratio", None), default=None)
+        if not self._is_dual_active(dual_ratio):
+            return
+
+        student_last, student_best = self.wdir / "last_student.pt", self.wdir / "best_student.pt"
+        ckpt = {}
+        for f in student_last, student_best:
+            if f.exists():
+                if f is student_last:
+                    ckpt = strip_optimizer(f)
+                elif f is student_best:
+                    k = "train_results"  # update best_student.pt train_metrics from last_student.pt
+                    strip_optimizer(f, updates={k: ckpt[k]} if k in ckpt else None)
+                    LOGGER.info(f"\nValidating {f}...")
+                    self.validator.args.plots = self.args.plots
+                    self.validator(model=f)
 
     @staticmethod
     def _copy_compact_student_weights(src_model, dst_model):
