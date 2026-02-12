@@ -403,7 +403,18 @@ class BaseTrainer:
                 # Forward
                 with autocast(self.amp):
                     batch = self.preprocess_batch(batch)
-                    loss, self.loss_items = self.model(batch)
+                    model_ref = self.model.module if hasattr(self.model, "module") else self.model
+                    request_bn_dims = bool(getattr(self.args, "print_bn_params_dims", False)) and hasattr(
+                        model_ref, "get_dual_bn_parameters"
+                    )
+                    outputs = self.model(batch, return_bn_params=True) if request_bn_dims else self.model(batch)
+                    if isinstance(outputs, (tuple, list)) and len(outputs) == 3:
+                        loss, self.loss_items, bn_params = outputs
+                        if RANK in {-1, 0} and i == 0:
+                            self._log_bn_param_dims(bn_params)
+                    else:
+                        loss, self.loss_items = outputs
+
                     self.loss = loss.sum()
                     if RANK != -1:
                         self.loss *= world_size
@@ -739,6 +750,27 @@ class BaseTrainer:
         """Register plots (e.g. to be consumed in callbacks)."""
         path = Path(name)
         self.plots[path] = {"data": data, "timestamp": time.time()}
+
+    def _log_bn_param_dims(self, bn_params):
+        """Log tensor shapes for returned dual-BN parameter dictionaries."""
+        if not isinstance(bn_params, dict):
+            LOGGER.info(f"BN params output type: {type(bn_params).__name__}")
+            return
+        for branch in ("full", "subnet"):
+            branch_params = bn_params.get(branch, {})
+            if not isinstance(branch_params, dict):
+                LOGGER.info(f"BN params [{branch}] type: {type(branch_params).__name__}")
+                continue
+            shape_map = {}
+            for module_name, state in branch_params.items():
+                if isinstance(state, dict):
+                    shape_map[module_name] = {
+                        key: tuple(value.shape) if hasattr(value, "shape") else type(value).__name__
+                        for key, value in state.items()
+                    }
+                else:
+                    shape_map[module_name] = type(state).__name__
+            LOGGER.info(f"BN params [{branch}] tensor shapes: {shape_map}")
 
     def final_eval(self):
         """Perform final evaluation and validation for object detection YOLO model."""

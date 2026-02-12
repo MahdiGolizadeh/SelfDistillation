@@ -573,6 +573,19 @@ class DetectionModel(BaseModel):
                 if isinstance(child, nn.BatchNorm2d):
                     setattr(module, name, DualBatchNorm2d.from_batchnorm(child))
 
+    def get_dual_bn_parameters(self):
+        """Return BatchNorm parameters for full and subnet branches keyed by module path."""
+        bn_params = {"full": {}, "subnet": {}}
+        for name, module in self.named_modules():
+            if isinstance(module, DualBatchNorm2d):
+                bn_params["full"][name] = {
+                    k: v.detach().cpu().clone() for k, v in module.bn_full.state_dict().items()
+                }
+                bn_params["subnet"][name] = {
+                    k: v.detach().cpu().clone() for k, v in module.bn_subnet.state_dict().items()
+                }
+        return bn_params
+
     @staticmethod
     def _build_hardcoded_yolo11n(nc=80, width_mult=1.0):
         """Build YOLO11n detection architecture directly as PyTorch modules (no YAML parsing)."""
@@ -657,7 +670,7 @@ class DetectionModel(BaseModel):
         value = float(text)
         return int(value) if value.is_integer() else value
 
-    def loss(self, batch, preds=None):
+    def loss(self, batch, preds=None, return_bn_params=False):
         """Compute standard or dual-channel (subnet + full-net) detection loss."""
         if getattr(self, "criterion", None) is None:
             self.criterion = self.init_criterion()
@@ -674,7 +687,10 @@ class DetectionModel(BaseModel):
         )
         if not use_dual:
             preds = self.forward(batch["img"]) if preds is None else preds
-            return self.criterion(preds, batch)
+            loss_output = self.criterion(preds, batch)
+            if return_bn_params:
+                return (*loss_output, self.get_dual_bn_parameters())
+            return loss_output
 
         # 1) Subnet pass (e.g. ratio=1/3 keeps first 16 of 48 channels in stem conv).
         with self.active_bn_mode("subnet"):
@@ -690,7 +706,10 @@ class DetectionModel(BaseModel):
 
         alpha = float(self.dual_channel_loss_weight)
         train_items = torch.cat((items_full, items_subnet))
-        return loss_full + alpha * loss_subnet, train_items
+        loss_output = (loss_full + alpha * loss_subnet, train_items)
+        if return_bn_params:
+            return (*loss_output, self.get_dual_bn_parameters())
+        return loss_output
 
     @staticmethod
     def _descale_pred(p, flips, scale, img_size, dim=1):
