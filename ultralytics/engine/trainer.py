@@ -408,10 +408,13 @@ class BaseTrainer:
                         model_ref, "get_dual_bn_parameters"
                     )
                     outputs = self.model(batch, return_bn_params=True) if request_bn_dims else self.model(batch)
-                    if isinstance(outputs, (tuple, list)) and len(outputs) == 3:
-                        loss, self.loss_items, bn_params = outputs
-                        if RANK in {-1, 0} and i == 0:
-                            self._log_bn_param_dims(bn_params)
+                    if isinstance(outputs, (tuple, list)):
+                        loss, self.loss_items = outputs[:2]
+                        extra_outputs = outputs[2:]
+                        if request_bn_dims and extra_outputs:
+                            bn_params = extra_outputs[0]
+                            if RANK in {-1, 0} and i == 0:
+                                self._log_bn_param_dims(bn_params)
                     else:
                         loss, self.loss_items = outputs
 

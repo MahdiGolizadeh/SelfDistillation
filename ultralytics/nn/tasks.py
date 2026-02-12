@@ -707,9 +707,10 @@ class DetectionModel(BaseModel):
         alpha = float(self.dual_channel_loss_weight)
         train_items = torch.cat((items_full, items_subnet))
         loss_output = (loss_full + alpha * loss_subnet, train_items)
+        logits = {"full": preds_full, "subnet": preds_subnet}
         if return_bn_params:
-            return (*loss_output, self.get_dual_bn_parameters())
-        return loss_output
+            return (*loss_output, self.get_dual_bn_parameters(), logits)
+        return (*loss_output, logits)
 
     @staticmethod
     def _descale_pred(p, flips, scale, img_size, dim=1):
