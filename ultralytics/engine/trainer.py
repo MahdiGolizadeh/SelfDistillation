@@ -411,10 +411,21 @@ class BaseTrainer:
                     if isinstance(outputs, (tuple, list)):
                         loss, self.loss_items = outputs[:2]
                         extra_outputs = outputs[2:]
-                        if request_bn_dims and extra_outputs:
-                            bn_params = extra_outputs[0]
-                            if RANK in {-1, 0} and i == 0:
-                                self._log_bn_param_dims(bn_params)
+                        # print(type(extra_outputs[1]["full"]), type(extra_outputs[1]["subnet"]))
+                        # print(len(extra_outputs[1]["full"]), len(extra_outputs[1]["subnet"]))
+                        # print("teacher dimension")
+                        # print(extra_outputs[1]["full"][0].shape, extra_outputs[1]["full"][0].requires_grad)
+                        # print(extra_outputs[1]["full"][1].shape, extra_outputs[1]["full"][1].requires_grad)
+                        # print(extra_outputs[1]["full"][2].shape, extra_outputs[1]["full"][2].requires_grad)
+                        # print("student dimension")
+                        # print(extra_outputs[1]["subnet"][0].shape, extra_outputs[1]["subnet"][0].requires_grad)
+                        # print(extra_outputs[1]["subnet"][1].shape, extra_outputs[1]["subnet"][1].requires_grad)
+                        # print(extra_outputs[1]["subnet"][2].shape, extra_outputs[1]["subnet"][2].requires_grad)
+                        # if request_bn_dims and extra_outputs:
+                        #     bn_params = extra_outputs[0]
+                        #     if RANK in {-1, 0} and i == 0:
+                        #         self._log_bn_param_dims(bn_params)
+                        #         print("hello")
                     else:
                         loss, self.loss_items = outputs
 
