@@ -480,9 +480,13 @@ class BaseTrainer:
                             ]
                             return f"{prefix:<14} | " + " | ".join(f"{k}: {v}" for k, v in fields)
 
-                        line1 = _format_row("Teacher+Distill", teacher_idx + distill_idx)
-                        line2 = _format_row("Student", student_idx)
-                        pbar.set_description(line1 + "\n" + line2)
+                        lines = [
+                            _format_row("Teacher", teacher_idx),
+                            _format_row("Student", student_idx),
+                        ]
+                        if distill_idx:
+                            lines.append(_format_row("Distill", distill_idx))
+                        pbar.set_description("\n".join(lines))
                     else:
                         pbar.set_description(
                             ("%11s" * 2 + "%11.4g" * (2 + loss_length))
