@@ -9,6 +9,7 @@ Usage:
 import gc
 import math
 import os
+import shutil
 import subprocess
 import time
 import warnings
@@ -383,7 +384,12 @@ class BaseTrainer:
 
             if RANK in {-1, 0}:
                 LOGGER.info(self.progress_string())
-                pbar = TQDM(enumerate(self.train_loader), total=nb)
+                pbar = TQDM(
+                    enumerate(self.train_loader),
+                    total=nb,
+                    dynamic_ncols=False,
+                    ncols=max(shutil.get_terminal_size(fallback=(120, 20)).columns, 420),
+                )
             self.tloss = None
             for i, batch in pbar:
                 self.run_callbacks("on_train_batch_start")
