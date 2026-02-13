@@ -7,8 +7,10 @@ import types
 from copy import deepcopy
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -73,6 +75,7 @@ from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, YAML, 
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
     E2EDetectLoss,
+    generate_masks_from_teacher_tal,
     v8ClassificationLoss,
     v8DetectionLoss,
     v8OBBLoss,
@@ -82,6 +85,7 @@ from ultralytics.utils.loss import (
 from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.patches import torch_load
 from ultralytics.utils.plotting import feature_visualization
+from ultralytics.utils.tal import make_anchors
 from ultralytics.utils.torch_utils import (
     fuse_conv_and_bn,
     fuse_deconv_and_bn,
@@ -705,12 +709,313 @@ class DetectionModel(BaseModel):
         loss_full, items_full = self.criterion(preds_full, batch)
 
         alpha = float(self.dual_channel_loss_weight)
+        cls_dist_alpha = float(getattr(self.args, "cls_alpha", 0.0))
+        cls_dist_temp = float(getattr(self.args, "cls_dist_t", 1.0))
+        m2d2_alpha = float(getattr(self.args, "m2d2_alpha", 0.0))
+        m2d2_temp = float(getattr(self.args, "m2d2_t", 1.0))
+        l2_alpha = float(getattr(self.args, "l2_alpha", 0.0))
+        use_cls_fg_mask = bool(getattr(self.args, "cls_fg_mask", False))
+        use_dfl_fg_mask = bool(getattr(self.args, "dfl_fg_mask", False))
+        use_l2_fg_mask = bool(getattr(self.args, "l2_fg_mask", False))
+        mask_type = str(getattr(self.args, "mask_type", "original"))
+
+        need_tal = (
+            (cls_dist_alpha > 0.0 and use_cls_fg_mask)
+            or (m2d2_alpha > 0.0 and use_dfl_fg_mask)
+            or (l2_alpha > 0.0 and use_l2_fg_mask)
+        )
+        tal_data = None
+        if need_tal:
+            tal_data = self._compute_teacher_tal_data(self._extract_train_feats(preds_full), batch, self.criterion, mask_type=mask_type)
+
+        if cls_dist_alpha > 0.0:
+            distill_cls_loss = self._compute_cls_kl_distillation_loss(
+                teacher_preds=preds_full,
+                student_preds=preds_subnet,
+                temperature=cls_dist_temp,
+                level_weights=getattr(self.args, "level_weights", None),
+                masks=tal_data["masks"] if use_cls_fg_mask and tal_data is not None else None,
+            )
+        else:
+            distill_cls_loss = loss_full.new_tensor(0.0)
+
+        if m2d2_alpha > 0.0:
+            m2d2_loss = self._compute_m2d2_distillation_loss(
+                teacher_preds=preds_full,
+                student_preds=preds_subnet,
+                temperature=m2d2_temp,
+                target_labels=tal_data["target_labels"] if tal_data is not None else None,
+                masks=tal_data["masks"] if use_dfl_fg_mask and tal_data is not None else None,
+                level_weights=getattr(self.args, "level_weights", None),
+            )
+        else:
+            m2d2_loss = loss_full.new_tensor(0.0)
+
+        if l2_alpha > 0.0:
+            l2_loss = self._compute_l2_bbox_distillation_loss(
+                teacher_preds=preds_full,
+                student_preds=preds_subnet,
+                masks=tal_data["masks"] if use_l2_fg_mask and tal_data is not None else None,
+                level_weights=getattr(self.args, "level_weights", None),
+            )
+        else:
+            l2_loss = loss_full.new_tensor(0.0)
+
         train_items = torch.cat((items_full, items_subnet))
-        loss_output = (loss_full + alpha * loss_subnet, train_items)
+        loss_output = (
+            loss_full + alpha * loss_subnet + cls_dist_alpha * distill_cls_loss + m2d2_alpha * m2d2_loss + l2_alpha * l2_loss,
+            train_items,
+        )
         logits = {"full": preds_full, "subnet": preds_subnet}
         if return_bn_params:
             return (*loss_output, self.get_dual_bn_parameters(), logits)
         return (*loss_output, logits)
+
+    @staticmethod
+    def _extract_train_feats(preds):
+        """Extract training feature maps from raw forward outputs."""
+        return preds[1] if isinstance(preds, tuple) else preds
+
+    def _compute_teacher_tal_data(self, teacher_feats, batch, criterion, mask_type="original"):
+        """Build teacher TAL data including foreground masks and assigned labels."""
+        with torch.no_grad():
+            pred_distri, pred_scores = torch.cat(
+                [xi.view(teacher_feats[0].shape[0], criterion.no, -1) for xi in teacher_feats], 2
+            ).split((criterion.reg_max * 4, criterion.nc), 1)
+            pred_scores = pred_scores.permute(0, 2, 1).contiguous()
+            pred_distri = pred_distri.permute(0, 2, 1).contiguous()
+
+            dtype = pred_scores.dtype
+            batch_size = pred_scores.shape[0]
+            imgsz = torch.tensor(teacher_feats[0].shape[2:], device=criterion.device, dtype=dtype) * criterion.stride[0]
+            anchor_points, stride_tensor = make_anchors(teacher_feats, criterion.stride, 0.5)
+
+            targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+            targets = criterion.preprocess(targets.to(criterion.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+            gt_labels, gt_bboxes = targets.split((1, 4), 2)
+            mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
+            pred_bboxes = criterion.bbox_decode(anchor_points, pred_distri)
+            target_labels, _, _, fg_mask, _ = criterion.assigner(
+                pred_scores.detach().sigmoid(),
+                (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+                anchor_points * stride_tensor,
+                gt_labels,
+                gt_bboxes,
+                mask_gt,
+            )
+
+        masks = generate_masks_from_teacher_tal(fg_mask, teacher_feats, mask_type=mask_type)
+        return {"masks": masks, "target_labels": target_labels}
+
+    def _compute_cls_kl_distillation_loss(self, teacher_preds, student_preds, temperature=1.0, level_weights=None, masks=None):
+        """Compute KL class distillation between full-net (teacher) and subnet (student) prediction heads."""
+        teacher_feats = self._extract_train_feats(teacher_preds)
+        student_feats = self._extract_train_feats(student_preds)
+        if len(teacher_feats) != len(student_feats):
+            raise ValueError("Teacher and student feature levels must match for class distillation")
+
+        num_levels = len(teacher_feats)
+        if level_weights is None:
+            level_weights = [1.0] * num_levels
+        if len(level_weights) != num_levels:
+            raise ValueError(f"level_weights length ({len(level_weights)}) must match number of levels ({num_levels})")
+        if masks is not None and len(masks) != num_levels:
+            raise ValueError(f"masks length ({len(masks)}) must match number of levels ({num_levels})")
+
+        distill_cls_loss = teacher_feats[0].new_tensor(0.0)
+        class_channels = int(self.model[-1].nc)
+        for i, (s_pred, t_pred) in enumerate(zip(student_feats, teacher_feats)):
+            s_logits = s_pred[:, -class_channels:, :, :]
+            t_logits = t_pred[:, -class_channels:, :, :]
+
+            with torch.no_grad():
+                t_probs = F.softmax(t_logits / temperature, dim=1)
+            s_log_probs = F.log_softmax(s_logits / temperature, dim=1)
+
+            kl = F.kl_div(s_log_probs, t_probs, reduction="none").sum(dim=1)
+            kl = kl * (temperature * temperature)
+
+            if masks is not None:
+                fg_mask = masks[i].squeeze(1)
+                loss_level = (kl * fg_mask).sum() / (fg_mask.sum() + 1e-6)
+            else:
+                loss_level = kl.mean()
+
+            distill_cls_loss = distill_cls_loss + float(level_weights[i]) * loss_level
+        return distill_cls_loss
+
+    @staticmethod
+    def _connected_components_2d(mask):
+        """Return connected component labels for a binary 2D numpy mask (4-connectivity)."""
+        h, w = mask.shape
+        labels = np.zeros((h, w), dtype=np.int32)
+        comp_id = 0
+        for y in range(h):
+            for x in range(w):
+                if mask[y, x] == 0 or labels[y, x] != 0:
+                    continue
+                comp_id += 1
+                stack = [(y, x)]
+                labels[y, x] = comp_id
+                while stack:
+                    cy, cx = stack.pop()
+                    if cy > 0 and mask[cy - 1, cx] and labels[cy - 1, cx] == 0:
+                        labels[cy - 1, cx] = comp_id
+                        stack.append((cy - 1, cx))
+                    if cy + 1 < h and mask[cy + 1, cx] and labels[cy + 1, cx] == 0:
+                        labels[cy + 1, cx] = comp_id
+                        stack.append((cy + 1, cx))
+                    if cx > 0 and mask[cy, cx - 1] and labels[cy, cx - 1] == 0:
+                        labels[cy, cx - 1] = comp_id
+                        stack.append((cy, cx - 1))
+                    if cx + 1 < w and mask[cy, cx + 1] and labels[cy, cx + 1] == 0:
+                        labels[cy, cx + 1] = comp_id
+                        stack.append((cy, cx + 1))
+        return labels, comp_id
+
+    def _build_m2d2_teacher_preds(self, teacher_feats, target_labels, masks):
+        """Apply M2D2 component-wise/class-wise DFL averaging on teacher prediction maps."""
+        class_channels = int(self.model[-1].nc)
+        updated_preds = []
+        offset = 0
+        for lvl, feat in enumerate(teacher_feats):
+            b, c, h, w = feat.shape
+            hw = h * w
+            lvl_labels = target_labels[:, offset : offset + hw].detach().to(torch.long).cpu().numpy()
+            offset += hw
+
+            feat_flat = feat.view(b, c, hw).clone()
+            cls_part = feat_flat[:, -class_channels:, :]
+            dfl_part = feat_flat[:, : c - class_channels, :]
+            mask_np = masks[lvl].squeeze(1).detach().bool().cpu().numpy()
+
+            for bi in range(b):
+                mask_2d = mask_np[bi].reshape(h, w).astype(np.uint8)
+                if mask_2d.sum() == 0:
+                    continue
+                labeled_array, num_features = self._connected_components_2d(mask_2d)
+                if num_features == 0:
+                    continue
+
+                labels_flat = lvl_labels[bi]
+                labeled_flat = labeled_array.reshape(-1)
+                for comp_id in range(1, num_features + 1):
+                    comp_idx = np.nonzero(labeled_flat == comp_id)[0]
+                    if comp_idx.size == 0:
+                        continue
+                    for cls in np.unique(labels_flat[comp_idx]):
+                        cls_idx = comp_idx[labels_flat[comp_idx] == cls]
+                        if cls_idx.size == 0:
+                            continue
+                        pos_idx = torch.from_numpy(cls_idx).long().to(feat.device)
+                        vals = dfl_part[bi][:, pos_idx]
+                        dfl_part[bi][:, pos_idx] = vals.mean(dim=1, keepdim=True)
+
+            updated_preds.append(torch.cat([dfl_part, cls_part], dim=1).view(b, c, h, w))
+        return updated_preds
+
+    def _compute_m2d2_distillation_loss(
+        self,
+        teacher_preds,
+        student_preds,
+        temperature=1.0,
+        target_labels=None,
+        masks=None,
+        level_weights=None,
+    ):
+        """Compute M2D2 KL distillation on DFL channels after teacher component-wise smoothing."""
+        teacher_feats = self._extract_train_feats(teacher_preds)
+        student_feats = self._extract_train_feats(student_preds)
+        if len(teacher_feats) != len(student_feats):
+            raise ValueError("Teacher and student feature levels must match for M2D2 distillation")
+        if target_labels is None:
+            raise ValueError("target_labels from teacher TAL assignment are required for M2D2 distillation")
+
+        num_levels = len(teacher_feats)
+        if level_weights is None:
+            level_weights = [1.0] * num_levels
+        if len(level_weights) != num_levels:
+            raise ValueError(f"level_weights length ({len(level_weights)}) must match number of levels ({num_levels})")
+
+        if masks is None:
+            masks = [torch.ones(f.shape[0], 1, f.shape[2], f.shape[3], device=f.device, dtype=f.dtype) for f in teacher_feats]
+        if len(masks) != num_levels:
+            raise ValueError(f"masks length ({len(masks)}) must match number of levels ({num_levels})")
+
+        updated_teacher = self._build_m2d2_teacher_preds(teacher_feats, target_labels, masks)
+        reg_max = int(self.model[-1].reg_max)
+        dfl_channels = 4 * reg_max
+        distill_loss = teacher_feats[0].new_tensor(0.0)
+        total_weight = 0.0
+
+        for i, (sp, tp) in enumerate(zip(student_feats, updated_teacher)):
+            b, _, h, w = sp.shape
+            sp_dfl = sp[:, :dfl_channels, :, :].view(b, 4, reg_max, h, w)
+            tp_dfl = tp[:, :dfl_channels, :, :].view(b, 4, reg_max, h, w)
+
+            with torch.no_grad():
+                tp_prob = F.softmax(tp_dfl / temperature, dim=2)
+            sp_log_prob = F.log_softmax(sp_dfl / temperature, dim=2)
+
+            kl_spatial = F.kl_div(sp_log_prob, tp_prob, reduction="none").sum(dim=2).mean(dim=1)
+            kl_spatial = kl_spatial * (temperature * temperature)
+
+            if masks is not None:
+                fg = masks[i].squeeze(1)
+                loss_level = (kl_spatial * fg).sum() / (fg.sum() + 1e-6)
+            else:
+                loss_level = kl_spatial.mean()
+
+            w = float(level_weights[i])
+            distill_loss = distill_loss + w * loss_level
+            total_weight += w
+
+        return distill_loss / max(total_weight, 1e-6)
+
+    def _compute_l2_bbox_distillation_loss(self, teacher_preds, student_preds, masks=None, level_weights=None):
+        """Compute L2 distillation over expected DFL box offsets with optional foreground masking."""
+        teacher_feats = self._extract_train_feats(teacher_preds)
+        student_feats = self._extract_train_feats(student_preds)
+        if len(teacher_feats) != len(student_feats):
+            raise ValueError("Teacher and student feature levels must match for L2 bbox distillation")
+
+        num_levels = len(teacher_feats)
+        if level_weights is None:
+            level_weights = [1.0] * num_levels
+        if len(level_weights) != num_levels:
+            raise ValueError(f"level_weights length ({len(level_weights)}) must match number of levels ({num_levels})")
+        if masks is not None and len(masks) != num_levels:
+            raise ValueError(f"masks length ({len(masks)}) must match number of levels ({num_levels})")
+
+        reg_max = int(self.model[-1].reg_max)
+        dfl_channels = 4 * reg_max
+        bins = torch.arange(reg_max, device=teacher_feats[0].device, dtype=teacher_feats[0].dtype).view(1, 1, reg_max, 1, 1)
+
+        loss = teacher_feats[0].new_tensor(0.0)
+        total_weight = 0.0
+        for i, (sp, tp) in enumerate(zip(student_feats, teacher_feats)):
+            b, _, h, w = sp.shape
+            sp_dfl = sp[:, :dfl_channels, :, :].view(b, 4, reg_max, h, w)
+            tp_dfl = tp[:, :dfl_channels, :, :].view(b, 4, reg_max, h, w)
+
+            sp_prob = F.softmax(sp_dfl, dim=2)
+            tp_prob = F.softmax(tp_dfl, dim=2)
+
+            sp_val = (sp_prob * bins).sum(dim=2) / reg_max
+            tp_val = (tp_prob * bins).sum(dim=2) / reg_max
+            l2_spatial = (sp_val - tp_val).pow(2).mean(dim=1)
+
+            if masks is not None:
+                fg = masks[i].squeeze(1)
+                loss_level = (l2_spatial * fg).sum() / (fg.sum() + 1e-6)
+            else:
+                loss_level = l2_spatial.mean()
+
+            w = float(level_weights[i])
+            loss = loss + w * loss_level
+            total_weight += w
+
+        return loss / max(total_weight, 1e-6)
 
     @staticmethod
     def _descale_pred(p, flips, scale, img_size, dim=1):

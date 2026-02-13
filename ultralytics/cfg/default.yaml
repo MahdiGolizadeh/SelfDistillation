@@ -40,6 +40,12 @@ multi_scale: False # (bool) Whether to use multiscale during training
 dual_channel_ratio: 3 # (int | float | str) student subnet spec: int divisor (3=>channels/3) or ratio (<1)
 dual_channel_loss_weight: 1.0 # (float) weight for student loss when using dual-channel training
 print_bn_params_dims: False # (bool) request dual-BN params from loss output and log their tensor shapes
+cls_alpha: 0.0 # (float) weight for KL class distillation from full-net teacher to subnet student
+cls_dist_t: 1.0 # (float) temperature for KL class distillation
+level_weights: [1.0, 1.0, 1.0] # (list[float]) per-head weights for KL class distillation
+m2d2_alpha: 0.0 # (float) weight for M2D2 DFL distillation from full-net teacher to subnet student
+m2d2_t: 1.0 # (float) temperature for M2D2 distillation
+l2_alpha: 0.0 # (float) weight for L2 bbox distillation from full-net teacher to subnet student
 cls_fg_mask: False # (bool) gate distillation classification loss with teacher TAL foreground masks
 dfl_fg_mask: False # (bool) gate distillation DFL-style losses with teacher TAL foreground masks
 l2_fg_mask: False # (bool) gate distillation box L2 loss with teacher TAL foreground masks
