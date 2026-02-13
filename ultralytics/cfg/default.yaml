@@ -40,6 +40,10 @@ multi_scale: False # (bool) Whether to use multiscale during training
 dual_channel_ratio: 3 # (int | float | str) student subnet spec: int divisor (3=>channels/3) or ratio (<1)
 dual_channel_loss_weight: 1.0 # (float) weight for student loss when using dual-channel training
 print_bn_params_dims: False # (bool) request dual-BN params from loss output and log their tensor shapes
+cls_fg_mask: False # (bool) gate distillation classification loss with teacher TAL foreground masks
+dfl_fg_mask: False # (bool) gate distillation DFL-style losses with teacher TAL foreground masks
+l2_fg_mask: False # (bool) gate distillation box L2 loss with teacher TAL foreground masks
+mask_type: original # (str) teacher TAL mask build mode, choices=[original, pyramid]
 # Segmentation
 overlap_mask: True # (bool) merge object masks into a single image mask during training (segment train only)
 mask_ratio: 4 # (int) mask downsample ratio (segment train only)

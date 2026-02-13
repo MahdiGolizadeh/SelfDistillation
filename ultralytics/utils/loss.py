@@ -15,6 +15,67 @@ from .metrics import bbox_iou, probiou
 from .tal import bbox2dist
 
 
+def generate_masks_from_teacher_tal(
+    t_mask: torch.Tensor, teacher_preds: List[torch.Tensor], mask_type: str = "original"
+) -> List[torch.Tensor]:
+    """Build per-head binary foreground masks from a flattened teacher TAL foreground map.
+
+    Args:
+        t_mask (torch.Tensor): Flattened teacher TAL assignment mask with shape (B, sum(H_i*W_i)).
+        teacher_preds (List[torch.Tensor]): Teacher prediction feature maps per level, each shaped (B, C, H, W).
+        mask_type (str): Mask construction mode, either:
+            - ``"original"``: return per-level masks sliced directly from ``t_mask``.
+            - ``"pyramid"``: OR-fuse all levels at highest resolution then downsample back per level.
+
+    Returns:
+        (List[torch.Tensor]): A list of per-level masks with shape (B, 1, H, W), float type in ``{0, 1}``.
+    """
+    if not isinstance(teacher_preds, (list, tuple)) or len(teacher_preds) == 0:
+        raise ValueError("teacher_preds must be a non-empty list/tuple of feature maps")
+    if t_mask.ndim != 2:
+        raise ValueError(f"t_mask must have shape (B, N), but got {tuple(t_mask.shape)}")
+
+    batch = t_mask.shape[0]
+    level_shapes = []
+    level_sizes = []
+    for i, pred in enumerate(teacher_preds):
+        if pred.ndim != 4:
+            raise ValueError(f"teacher_preds[{i}] must have shape (B, C, H, W), but got {tuple(pred.shape)}")
+        if pred.shape[0] != batch:
+            raise ValueError(
+                f"Batch mismatch between t_mask ({batch}) and teacher_preds[{i}] ({pred.shape[0]})"
+            )
+        h, w = pred.shape[-2:]
+        level_shapes.append((h, w))
+        level_sizes.append(h * w)
+
+    total_size = sum(level_sizes)
+    if t_mask.shape[1] != total_size:
+        raise ValueError(f"t_mask has {t_mask.shape[1]} entries, expected {total_size} from teacher_preds")
+
+    offset = 0
+    per_level_masks = []
+    for (h, w), size in zip(level_shapes, level_sizes):
+        flat_level = t_mask[:, offset : offset + size]
+        per_level_masks.append(flat_level.view(batch, 1, h, w).float())
+        offset += size
+
+    if mask_type == "original":
+        return per_level_masks
+    if mask_type != "pyramid":
+        raise ValueError(f"Unsupported mask_type '{mask_type}'. Expected one of ['original', 'pyramid']")
+
+    base_h, base_w = level_shapes[0]
+    fused = per_level_masks[0]
+    for mask in per_level_masks[1:]:
+        mask_up = F.interpolate(mask, size=(base_h, base_w), mode="nearest")
+        fused = torch.maximum(fused, mask_up)
+
+    return [
+        fused if i == 0 else F.interpolate(fused, size=(h, w), mode="nearest")
+        for i, (h, w) in enumerate(level_shapes)
+    ]
+
 class VarifocalLoss(nn.Module):
     """
     Varifocal loss by Zhang et al.
