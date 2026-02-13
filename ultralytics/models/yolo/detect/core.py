@@ -196,14 +196,21 @@ class DetectionTrainer(BaseTrainer):
         dual_fraction = isinstance(dual_ratio, float) and 0.0 < dual_ratio < 1.0
         dual_divisor = isinstance(dual_ratio, int) and dual_ratio > 1
         if dual_fraction or dual_divisor:
-            self.train_loss_names = (
+            train_loss_names = [
                 "teacher_box_loss",
                 "teacher_cls_loss",
                 "teacher_dfl_loss",
                 "student_box_loss",
                 "student_cls_loss",
                 "student_dfl_loss",
-            )
+            ]
+            if bool(getattr(self.args, "cls_dist", float(getattr(self.args, "cls_alpha", 0.0)) > 0.0)):
+                train_loss_names.append("distill_cls_loss")
+            if bool(getattr(self.args, "m2d2_dist", float(getattr(self.args, "m2d2_alpha", 0.0)) > 0.0)):
+                train_loss_names.append("distill_m2d2_loss")
+            if bool(getattr(self.args, "l2_dist", float(getattr(self.args, "l2_alpha", 0.0)) > 0.0)):
+                train_loss_names.append("distill_l2_loss")
+            self.train_loss_names = tuple(train_loss_names)
         else:
             self.train_loss_names = self.loss_names
         return yolo.detect.DetectionValidator(
@@ -336,6 +343,26 @@ class DetectionTrainer(BaseTrainer):
     def progress_string(self):
         """Return a formatted string of training progress with epoch, GPU memory, loss, instances and size."""
         names = getattr(self, "train_loss_names", self.loss_names)
+        if {"teacher_box_loss", "student_box_loss"}.issubset(set(names)):
+            teacher = [n for n in names if n.startswith("teacher_")]
+            student = [n for n in names if n.startswith("student_")]
+            distill = [n for n in names if n.startswith("distill_")]
+            header1 = ("\n" + "%11s" * (4 + len(teacher) + len(distill))) % (
+                "Epoch",
+                "GPU_mem",
+                *teacher,
+                *distill,
+                "Instances",
+                "Size",
+            )
+            header2 = ("\n" + "%11s" * (4 + len(student))) % (
+                "Epoch",
+                "GPU_mem",
+                *student,
+                "Instances",
+                "Size",
+            )
+            return header1 + header2
         return ("\n" + "%11s" * (4 + len(names))) % (
             "Epoch",
             "GPU_mem",

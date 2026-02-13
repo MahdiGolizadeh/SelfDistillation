@@ -457,16 +457,46 @@ class BaseTrainer:
                 # Log
                 if RANK in {-1, 0}:
                     loss_length = self.tloss.shape[0] if len(self.tloss.shape) else 1
-                    pbar.set_description(
-                        ("%11s" * 2 + "%11.4g" * (2 + loss_length))
-                        % (
+                    losses = self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)
+                    names = list(getattr(self, "train_loss_names", getattr(self, "loss_names", ())))
+                    if {"teacher_box_loss", "student_box_loss"}.issubset(set(names)) and len(losses) == len(names):
+                        teacher_idx = [i for i, n in enumerate(names) if n.startswith("teacher_")]
+                        student_idx = [i for i, n in enumerate(names) if n.startswith("student_")]
+                        distill_idx = [i for i, n in enumerate(names) if n.startswith("distill_")]
+                        shared = (
                             f"{epoch + 1}/{self.epochs}",
-                            f"{self._get_memory():.3g}G",  # (GB) GPU memory util
-                            *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),  # losses
-                            batch["cls"].shape[0],  # batch size, i.e. 8
-                            batch["img"].shape[-1],  # imgsz, i.e 640
+                            f"{self._get_memory():.3g}G",
+                            batch["cls"].shape[0],
+                            batch["img"].shape[-1],
                         )
-                    )
+                        line1 = ("%11s" * 2 + "%11.4g" * (2 + len(teacher_idx) + len(distill_idx))) % (
+                            shared[0],
+                            shared[1],
+                            *[losses[j] for j in teacher_idx],
+                            *[losses[j] for j in distill_idx],
+                            shared[2],
+                            shared[3],
+                        )
+                        line2 = ("%11s" * 2 + "%11.4g" * (2 + len(student_idx))) % (
+                            shared[0],
+                            shared[1],
+                            *[losses[j] for j in student_idx],
+                            shared[2],
+                            shared[3],
+                        )
+                        pbar.set_description(line1 + "\n" + line2)
+                    else:
+                        pbar.set_description(
+                            ("%11s" * 2 + "%11.4g" * (2 + loss_length))
+                            % (
+                                f"{epoch + 1}/{self.epochs}",
+                                f"{self._get_memory():.3g}G",  # (GB) GPU memory util
+                                *losses,  # losses
+                                batch["cls"].shape[0],  # batch size, i.e 8
+                                batch["img"].shape[-1],  # imgsz, i.e 640
+                            )
+                        )
+
                     self.run_callbacks("on_batch_end")
                     if self.args.plots and ni in self.plot_idx:
                         self.plot_training_samples(batch, ni)

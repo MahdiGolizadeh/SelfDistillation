@@ -725,9 +725,11 @@ class DetectionModel(BaseModel):
         use_l2_fg_mask = bool(getattr(self.args, "l2_fg_mask", False))
         mask_type = str(getattr(self.args, "mask_type", "original"))
 
+        # M2D2 always requires teacher TAL target labels and masks. Keep TAL enabled whenever M2D2 is active,
+        # regardless of optional foreground-mask flags.
         need_tal = (
-            (cls_dist_alpha > 0.0 and use_cls_fg_mask)
-            or (m2d2_alpha > 0.0 and use_dfl_fg_mask)
+            m2d2_alpha > 0.0
+            or (cls_dist_alpha > 0.0 and use_cls_fg_mask)
             or (l2_alpha > 0.0 and use_l2_fg_mask)
         )
         tal_data = None
@@ -751,7 +753,7 @@ class DetectionModel(BaseModel):
                 student_preds=preds_subnet,
                 temperature=m2d2_temp,
                 target_labels=tal_data["target_labels"] if tal_data is not None else None,
-                masks=tal_data["masks"] if use_dfl_fg_mask and tal_data is not None else None,
+                masks=tal_data["masks"] if tal_data is not None else None,
                 level_weights=getattr(self.args, "level_weights", None),
             )
         else:
@@ -775,7 +777,15 @@ class DetectionModel(BaseModel):
             m2d2_alpha = self._compute_adaptive_distill_alpha("m2d2", m2d2_alpha, m2d2_loss, ref_loss)
             l2_alpha = self._compute_adaptive_distill_alpha("l2", l2_alpha, l2_loss, ref_loss)
 
-        train_items = torch.cat((items_full, items_subnet))
+        # Track enabled distillation losses in training logs/results.csv.
+        distill_items = []
+        if cls_dist_alpha > 0.0:
+            distill_items.append(distill_cls_loss.detach().view(1))
+        if m2d2_alpha > 0.0:
+            distill_items.append(m2d2_loss.detach().view(1))
+        if l2_alpha > 0.0:
+            distill_items.append(l2_loss.detach().view(1))
+        train_items = torch.cat((items_full, items_subnet, *distill_items)) if distill_items else torch.cat((items_full, items_subnet))
         loss_output = (
             loss_full + alpha * loss_subnet + cls_dist_alpha * distill_cls_loss + m2d2_alpha * m2d2_loss + l2_alpha * l2_loss,
             train_items,
