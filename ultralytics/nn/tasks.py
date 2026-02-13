@@ -714,6 +714,12 @@ class DetectionModel(BaseModel):
         m2d2_alpha = float(getattr(self.args, "m2d2_alpha", 0.0))
         m2d2_temp = float(getattr(self.args, "m2d2_t", 1.0))
         l2_alpha = float(getattr(self.args, "l2_alpha", 0.0))
+        cls_dist_enabled = bool(getattr(self.args, "cls_dist", cls_dist_alpha > 0.0))
+        m2d2_enabled = bool(getattr(self.args, "m2d2_dist", m2d2_alpha > 0.0))
+        l2_enabled = bool(getattr(self.args, "l2_dist", l2_alpha > 0.0))
+        cls_dist_alpha = cls_dist_alpha if cls_dist_enabled else 0.0
+        m2d2_alpha = m2d2_alpha if m2d2_enabled else 0.0
+        l2_alpha = l2_alpha if l2_enabled else 0.0
         use_cls_fg_mask = bool(getattr(self.args, "cls_fg_mask", False))
         use_dfl_fg_mask = bool(getattr(self.args, "dfl_fg_mask", False))
         use_l2_fg_mask = bool(getattr(self.args, "l2_fg_mask", False))
@@ -761,6 +767,12 @@ class DetectionModel(BaseModel):
         else:
             l2_loss = loss_full.new_tensor(0.0)
 
+        if bool(getattr(self.args, "adaptive_distill_alpha", True)):
+            ref_loss = (loss_full.detach() + alpha * loss_subnet.detach()).float()
+            cls_dist_alpha = self._compute_adaptive_distill_alpha("cls", cls_dist_alpha, distill_cls_loss, ref_loss)
+            m2d2_alpha = self._compute_adaptive_distill_alpha("m2d2", m2d2_alpha, m2d2_loss, ref_loss)
+            l2_alpha = self._compute_adaptive_distill_alpha("l2", l2_alpha, l2_loss, ref_loss)
+
         train_items = torch.cat((items_full, items_subnet))
         loss_output = (
             loss_full + alpha * loss_subnet + cls_dist_alpha * distill_cls_loss + m2d2_alpha * m2d2_loss + l2_alpha * l2_loss,
@@ -770,6 +782,34 @@ class DetectionModel(BaseModel):
         if return_bn_params:
             return (*loss_output, self.get_dual_bn_parameters(), logits)
         return (*loss_output, logits)
+    def _compute_adaptive_distill_alpha(self, name, base_alpha, distill_loss, ref_loss):
+        """Adapt distillation alpha from EMA of supervised and distillation losses."""
+        if base_alpha <= 0.0:
+            return 0.0
+
+        if not hasattr(self, "_adaptive_alpha_state"):
+            self._adaptive_alpha_state = {}
+
+        momentum = float(getattr(self.args, "adaptive_alpha_momentum", 0.9))
+        momentum = min(max(momentum, 0.0), 0.9999)
+        min_scale = float(getattr(self.args, "adaptive_alpha_min_scale", 0.25))
+        max_scale = float(getattr(self.args, "adaptive_alpha_max_scale", 4.0))
+        eps = 1e-6
+
+        ref_value = max(float(ref_loss.detach().item()), eps)
+        distill_value = max(float(distill_loss.detach().item()), eps)
+        state = self._adaptive_alpha_state.get(name)
+
+        if state is None:
+            state = {"ref_ema": ref_value, "distill_ema": distill_value}
+        else:
+            state["ref_ema"] = momentum * state["ref_ema"] + (1.0 - momentum) * ref_value
+            state["distill_ema"] = momentum * state["distill_ema"] + (1.0 - momentum) * distill_value
+
+        self._adaptive_alpha_state[name] = state
+        scale = state["ref_ema"] / (state["distill_ema"] + eps)
+        scale = min(max(scale, min_scale), max_scale)
+        return base_alpha * scale
 
     @staticmethod
     def _extract_train_feats(preds):
