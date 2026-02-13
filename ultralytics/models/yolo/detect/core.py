@@ -347,21 +347,10 @@ class DetectionTrainer(BaseTrainer):
             teacher = [n for n in names if n.startswith("teacher_")]
             student = [n for n in names if n.startswith("student_")]
             distill = [n for n in names if n.startswith("distill_")]
-            header1 = ("\n" + "%11s" * (4 + len(teacher) + len(distill))) % (
-                "Epoch",
-                "GPU_mem",
-                *teacher,
-                *distill,
-                "Instances",
-                "Size",
+            header1 = "\nTeacher+Distill | " + " | ".join(
+                ["Epoch", "GPU_mem", *teacher, *distill, "Instances", "Size"]
             )
-            header2 = ("\n" + "%11s" * (4 + len(student))) % (
-                "Epoch",
-                "GPU_mem",
-                *student,
-                "Instances",
-                "Size",
-            )
+            header2 = "\nStudent        | " + " | ".join(["Epoch", "GPU_mem", *student, "Instances", "Size"])
             return header1 + header2
         return ("\n" + "%11s" * (4 + len(names))) % (
             "Epoch",

@@ -463,27 +463,25 @@ class BaseTrainer:
                         teacher_idx = [i for i, n in enumerate(names) if n.startswith("teacher_")]
                         student_idx = [i for i, n in enumerate(names) if n.startswith("student_")]
                         distill_idx = [i for i, n in enumerate(names) if n.startswith("distill_")]
-                        shared = (
-                            f"{epoch + 1}/{self.epochs}",
-                            f"{self._get_memory():.3g}G",
-                            batch["cls"].shape[0],
-                            batch["img"].shape[-1],
-                        )
-                        line1 = ("%11s" * 2 + "%11.4g" * (2 + len(teacher_idx) + len(distill_idx))) % (
-                            shared[0],
-                            shared[1],
-                            *[losses[j] for j in teacher_idx],
-                            *[losses[j] for j in distill_idx],
-                            shared[2],
-                            shared[3],
-                        )
-                        line2 = ("%11s" * 2 + "%11.4g" * (2 + len(student_idx))) % (
-                            shared[0],
-                            shared[1],
-                            *[losses[j] for j in student_idx],
-                            shared[2],
-                            shared[3],
-                        )
+                        shared = {
+                            "Epoch": f"{epoch + 1}/{self.epochs}",
+                            "GPU_mem": f"{self._get_memory():.3g}G",
+                            "Instances": f"{batch['cls'].shape[0]}",
+                            "Size": f"{batch['img'].shape[-1]}",
+                        }
+
+                        def _format_row(prefix, idxs):
+                            fields = [
+                                ("Epoch", shared["Epoch"]),
+                                ("GPU_mem", shared["GPU_mem"]),
+                                *[(names[j], f"{float(losses[j]):.4g}") for j in idxs],
+                                ("Instances", shared["Instances"]),
+                                ("Size", shared["Size"]),
+                            ]
+                            return f"{prefix:<14} | " + " | ".join(f"{k}: {v}" for k, v in fields)
+
+                        line1 = _format_row("Teacher+Distill", teacher_idx + distill_idx)
+                        line2 = _format_row("Student", student_idx)
                         pbar.set_description(line1 + "\n" + line2)
                     else:
                         pbar.set_description(
