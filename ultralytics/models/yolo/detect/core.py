@@ -343,16 +343,6 @@ class DetectionTrainer(BaseTrainer):
     def progress_string(self):
         """Return a formatted string of training progress with epoch, GPU memory, loss, instances and size."""
         names = getattr(self, "train_loss_names", self.loss_names)
-        if {"teacher_box_loss", "student_box_loss"}.issubset(set(names)):
-            teacher = [n for n in names if n.startswith("teacher_")]
-            student = [n for n in names if n.startswith("student_")]
-            distill = [n for n in names if n.startswith("distill_")]
-            header1 = "\nTeacher        | " + " | ".join(["Epoch", "GPU_mem", *teacher, "Instances", "Size"])
-            header2 = "\nStudent        | " + " | ".join(["Epoch", "GPU_mem", *student, "Instances", "Size"])
-            if distill:
-                header3 = "\nDistill        | " + " | ".join(["Epoch", "GPU_mem", *distill, "Instances", "Size"])
-                return header1 + header2 + header3
-            return header1 + header2
         return ("\n" + "%11s" * (4 + len(names))) % (
             "Epoch",
             "GPU_mem",

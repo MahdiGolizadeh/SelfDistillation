@@ -463,30 +463,21 @@ class BaseTrainer:
                         teacher_idx = [i for i, n in enumerate(names) if n.startswith("teacher_")]
                         student_idx = [i for i, n in enumerate(names) if n.startswith("student_")]
                         distill_idx = [i for i, n in enumerate(names) if n.startswith("distill_")]
-                        shared = {
-                            "Epoch": f"{epoch + 1}/{self.epochs}",
-                            "GPU_mem": f"{self._get_memory():.3g}G",
-                            "Instances": f"{batch['cls'].shape[0]}",
-                            "Size": f"{batch['img'].shape[-1]}",
-                        }
+                        
+                        def _format_metrics(prefix, idxs):
+                            values = ", ".join(f"{names[j]}={float(losses[j]):.4g}" for j in idxs)
+                            return f"{prefix}({values})" if values else None
 
-                        def _format_row(prefix, idxs):
-                            fields = [
-                                ("Epoch", shared["Epoch"]),
-                                ("GPU_mem", shared["GPU_mem"]),
-                                *[(names[j], f"{float(losses[j]):.4g}") for j in idxs],
-                                ("Instances", shared["Instances"]),
-                                ("Size", shared["Size"]),
-                            ]
-                            return f"{prefix:<14} | " + " | ".join(f"{k}: {v}" for k, v in fields)
-
-                        lines = [
-                            _format_row("Teacher", teacher_idx),
-                            _format_row("Student", student_idx),
+                        segments = [
+                            f"Epoch={epoch + 1}/{self.epochs}",
+                            f"GPU={self._get_memory():.3g}G",
+                            _format_metrics("Teacher", teacher_idx),
+                            _format_metrics("Student", student_idx),
+                            _format_metrics("Distill", distill_idx),
+                            f"Instances={batch['cls'].shape[0]}",
+                            f"Size={batch['img'].shape[-1]}",
                         ]
-                        if distill_idx:
-                            lines.append(_format_row("Distill", distill_idx))
-                        pbar.set_description("\n".join(lines))
+                        pbar.set_description(" | ".join(x for x in segments if x))
                     else:
                         pbar.set_description(
                             ("%11s" * 2 + "%11.4g" * (2 + loss_length))
