@@ -768,7 +768,9 @@ class DetectionModel(BaseModel):
             l2_loss = loss_full.new_tensor(0.0)
 
         if bool(getattr(self.args, "adaptive_distill_alpha", True)):
-            ref_loss = (loss_full.detach() + alpha * loss_subnet.detach()).float()
+            # Use the mean of supervised components (box/cls/dfl) as the common reference scale.
+            ref_items = (items_full.detach() + alpha * items_subnet.detach()).float()
+            ref_loss = ref_items.mean()
             cls_dist_alpha = self._compute_adaptive_distill_alpha("cls", cls_dist_alpha, distill_cls_loss, ref_loss)
             m2d2_alpha = self._compute_adaptive_distill_alpha("m2d2", m2d2_alpha, m2d2_loss, ref_loss)
             l2_alpha = self._compute_adaptive_distill_alpha("l2", l2_alpha, l2_loss, ref_loss)
@@ -796,8 +798,20 @@ class DetectionModel(BaseModel):
         max_scale = float(getattr(self.args, "adaptive_alpha_max_scale", 4.0))
         eps = 1e-6
 
-        ref_value = max(float(ref_loss.detach().item()), eps)
-        distill_value = max(float(distill_loss.detach().item()), eps)
+        ref_tensor = ref_loss.detach()
+        distill_tensor = distill_loss.detach()
+
+        # Reference loss may come from vector components (e.g. box/cls/dfl).
+        if ref_tensor.numel() > 1:
+            ref_tensor = ref_tensor.mean()
+
+        # Keep distillation tensors on the same scale basis as the supervised reference.
+        # If a branch returns component-wise vectors, average them before adaptive scaling.
+        if distill_tensor.numel() > 1:
+            distill_tensor = distill_tensor.mean()
+
+        ref_value = max(float(ref_tensor.item()), eps)
+        distill_value = max(float(distill_tensor.item()), eps)
         state = self._adaptive_alpha_state.get(name)
 
         if state is None:
