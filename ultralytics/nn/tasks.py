@@ -967,8 +967,8 @@ class DetectionModel(BaseModel):
             s_logits = s_pred[:, -class_channels:, :, :]
             t_logits = t_pred[:, -class_channels:, :, :]
 
-            with torch.no_grad():
-                t_probs = F.softmax(t_logits / temperature, dim=1)
+            # Online distillation: keep teacher branch in-graph so both teacher and student can be updated.
+            t_probs = F.softmax(t_logits / temperature, dim=1)
             s_log_probs = F.log_softmax(s_logits / temperature, dim=1)
 
             kl = F.kl_div(s_log_probs, t_probs, reduction="none").sum(dim=1)
@@ -1092,8 +1092,8 @@ class DetectionModel(BaseModel):
             sp_dfl = sp[:, :dfl_channels, :, :].view(b, 4, reg_max, h, w)
             tp_dfl = tp[:, :dfl_channels, :, :].view(b, 4, reg_max, h, w)
 
-            with torch.no_grad():
-                tp_prob = F.softmax(tp_dfl / temperature, dim=2)
+            # Online distillation: keep teacher branch in-graph so both teacher and student can be updated.
+            tp_prob = F.softmax(tp_dfl / temperature, dim=2)
             sp_log_prob = F.log_softmax(sp_dfl / temperature, dim=2)
 
             kl_spatial = F.kl_div(sp_log_prob, tp_prob, reduction="none").sum(dim=2).mean(dim=1)
