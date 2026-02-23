@@ -57,6 +57,10 @@ cls_fg_mask: False # (bool) gate distillation classification loss with teacher T
 dfl_fg_mask: False # (bool) gate distillation DFL-style losses with teacher TAL foreground masks
 l2_fg_mask: False # (bool) gate distillation box L2 loss with teacher TAL foreground masks
 mask_type: original # (str) teacher TAL mask build mode, choices=[original, pyramid]
+bn_capacity_reg: False # (bool) enable BN-gamma suppression for teacher-only channels in dual-channel training
+bn_capacity_reg_mode: ratio # (str) regularization mode for teacher-only channels, choices=[ratio, l1]
+bn_capacity_reg_lambda: 0.0 # (float) max regularization weight for BN-gamma suppression
+bn_capacity_reg_schedule: cosine # (str) annealing schedule for BN-gamma suppression, choices=[linear, cosine]
 # Segmentation
 overlap_mask: True # (bool) merge object masks into a single image mask during training (segment train only)
 mask_ratio: 4 # (int) mask downsample ratio (segment train only)

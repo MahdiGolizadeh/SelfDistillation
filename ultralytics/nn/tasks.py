@@ -6,6 +6,8 @@ import re
 import types
 from copy import deepcopy
 from pathlib import Path
+import math
+
 
 import numpy as np
 import torch
@@ -674,6 +676,73 @@ class DetectionModel(BaseModel):
         value = float(text)
         return int(value) if value.is_integer() else value
 
+    def _teacher_extra_channel_start(self, channels, ratio):
+        """Return first teacher-only channel index for current dual-channel ratio."""
+        if ratio is None:
+            return channels
+        if isinstance(ratio, (int, float)) and float(ratio).is_integer() and float(ratio) > 1:
+            return max(1, min(channels, channels // int(ratio)))
+
+        ratio = float(ratio)
+        if ratio >= 1.0:
+            return channels
+        return max(1, min(channels, int(round(channels * ratio))))
+
+    def _compute_bn_capacity_regularization(self, ratio):
+        """Compute BN-gamma suppression that biases capacity toward shared (student-visible) channels."""
+        if not bool(getattr(self.args, "bn_capacity_reg", False)):
+            return None
+
+        base_lambda = float(getattr(self.args, "bn_capacity_reg_lambda", 0.0))
+        if base_lambda <= 0.0:
+            return None
+
+        mode = str(getattr(self.args, "bn_capacity_reg_mode", "ratio")).strip().lower()
+        if mode not in {"ratio", "l1"}:
+            raise ValueError(f"Unsupported bn_capacity_reg_mode '{mode}'. Choose from ['ratio', 'l1']")
+
+        schedule = str(getattr(self.args, "bn_capacity_reg_schedule", "cosine")).strip().lower()
+        if schedule not in {"linear", "cosine"}:
+            raise ValueError(f"Unsupported bn_capacity_reg_schedule '{schedule}'. Choose from ['linear', 'cosine']")
+
+        total_epochs = max(float(getattr(self.args, "epochs", 0) or 0), 1.0)
+        epoch = float(getattr(self, "epoch", 0) or 0)
+        progress = min(max(epoch / total_epochs, 0.0), 1.0)
+        if schedule == "linear":
+            lambda_reg = base_lambda * progress
+        else:
+            lambda_reg = base_lambda * 0.5 * (1.0 - math.cos(math.pi * progress))
+
+        if lambda_reg <= 0.0:
+            return None
+
+        eps = 1e-8
+        reg = None
+        for module in self.modules():
+            if not isinstance(module, DualBatchNorm2d):
+                continue
+
+            gamma = module.bn_full.weight
+            c = gamma.shape[0]
+            keep = self._teacher_extra_channel_start(c, ratio)
+            if keep >= c:
+                continue
+
+            gamma_shared = gamma[:keep]
+            gamma_extra = gamma[keep:]
+            extra_sum = gamma_extra.abs().sum()
+            if mode == "l1":
+                layer_reg = extra_sum
+            else:
+                shared_sum = gamma_shared.abs().sum()
+                layer_reg = extra_sum / (shared_sum + eps)
+
+            reg = layer_reg if reg is None else reg + layer_reg
+
+        if reg is None:
+            return None
+        return lambda_reg * reg
+
     def loss(self, batch, preds=None, return_bn_params=False):
         """Compute standard or dual-channel (subnet + full-net) detection loss."""
         if getattr(self, "criterion", None) is None:
@@ -786,8 +855,14 @@ class DetectionModel(BaseModel):
         if l2_alpha > 0.0:
             distill_items.append(l2_loss.detach().view(1))
         train_items = torch.cat((items_full, items_subnet, *distill_items)) if distill_items else torch.cat((items_full, items_subnet))
+        bn_capacity_reg = self._compute_bn_capacity_regularization(ratio)
+        total_loss = loss_full + alpha * loss_subnet + cls_dist_alpha * distill_cls_loss + m2d2_alpha * m2d2_loss + l2_alpha * l2_loss
+        if bn_capacity_reg is not None:
+            total_loss = total_loss + bn_capacity_reg
+            train_items = torch.cat((train_items, bn_capacity_reg.detach().view(1)))
+            
         loss_output = (
-            loss_full + alpha * loss_subnet + cls_dist_alpha * distill_cls_loss + m2d2_alpha * m2d2_loss + l2_alpha * l2_loss,
+            total_loss,
             train_items,
         )
         logits = {"full": preds_full, "subnet": preds_subnet}

@@ -210,6 +210,8 @@ class DetectionTrainer(BaseTrainer):
                 train_loss_names.append("distill_m2d2_loss")
             if bool(getattr(self.args, "l2_dist", float(getattr(self.args, "l2_alpha", 0.0)) > 0.0)):
                 train_loss_names.append("distill_l2_loss")
+            if bool(getattr(self.args, "bn_capacity_reg", False)) and float(getattr(self.args, "bn_capacity_reg_lambda", 0.0)) > 0.0:
+                train_loss_names.append("bn_capacity_reg_loss")
             self.train_loss_names = tuple(train_loss_names)
         else:
             self.train_loss_names = self.loss_names
