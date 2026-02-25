@@ -778,6 +778,7 @@ class DetectionModel(BaseModel):
         loss_full, items_full = self.criterion(preds_full, batch)
 
         alpha = float(self.dual_channel_loss_weight)
+        teacher_distill_update = bool(getattr(self.args, "teacher_distill_update", True))
         cls_dist_alpha = float(getattr(self.args, "cls_alpha", 0.0))
         cls_dist_temp = float(getattr(self.args, "cls_dist_t", 1.0))
         m2d2_alpha = float(getattr(self.args, "m2d2_alpha", 0.0))
@@ -812,6 +813,7 @@ class DetectionModel(BaseModel):
                 temperature=cls_dist_temp,
                 level_weights=getattr(self.args, "level_weights", None),
                 masks=tal_data["masks"] if use_cls_fg_mask and tal_data is not None else None,
+                update_teacher=teacher_distill_update,
             )
         else:
             distill_cls_loss = loss_full.new_tensor(0.0)
@@ -824,6 +826,7 @@ class DetectionModel(BaseModel):
                 target_labels=tal_data["target_labels"] if tal_data is not None else None,
                 masks=tal_data["masks"] if tal_data is not None else None,
                 level_weights=getattr(self.args, "level_weights", None),
+                update_teacher=teacher_distill_update,
             )
         else:
             m2d2_loss = loss_full.new_tensor(0.0)
@@ -834,6 +837,7 @@ class DetectionModel(BaseModel):
                 student_preds=preds_subnet,
                 masks=tal_data["masks"] if use_l2_fg_mask and tal_data is not None else None,
                 level_weights=getattr(self.args, "level_weights", None),
+                update_teacher=teacher_distill_update,
             )
         else:
             l2_loss = loss_full.new_tensor(0.0)
@@ -946,7 +950,15 @@ class DetectionModel(BaseModel):
         masks = generate_masks_from_teacher_tal(fg_mask, teacher_feats, mask_type=mask_type)
         return {"masks": masks, "target_labels": target_labels}
 
-    def _compute_cls_kl_distillation_loss(self, teacher_preds, student_preds, temperature=1.0, level_weights=None, masks=None):
+    def _compute_cls_kl_distillation_loss(
+        self,
+        teacher_preds,
+        student_preds,
+        temperature=1.0,
+        level_weights=None,
+        masks=None,
+        update_teacher=True,
+    ):
         """Compute KL class distillation between full-net (teacher) and subnet (student) prediction heads."""
         teacher_feats = self._extract_train_feats(teacher_preds)
         student_feats = self._extract_train_feats(student_preds)
@@ -967,8 +979,9 @@ class DetectionModel(BaseModel):
             s_logits = s_pred[:, -class_channels:, :, :]
             t_logits = t_pred[:, -class_channels:, :, :]
 
-            # Online distillation: keep teacher branch in-graph so both teacher and student can be updated.
-            t_probs = F.softmax(t_logits / temperature, dim=1)
+            # Configurable distillation: optionally detach teacher branch for fixed-target distillation.
+            t_logits_for_distill = t_logits if update_teacher else t_logits.detach()
+            t_probs = F.softmax(t_logits_for_distill / temperature, dim=1)
             s_log_probs = F.log_softmax(s_logits / temperature, dim=1)
 
             kl = F.kl_div(s_log_probs, t_probs, reduction="none").sum(dim=1)
@@ -1061,6 +1074,7 @@ class DetectionModel(BaseModel):
         target_labels=None,
         masks=None,
         level_weights=None,
+        update_teacher=True,
     ):
         """Compute M2D2 KL distillation on DFL channels after teacher component-wise smoothing."""
         teacher_feats = self._extract_train_feats(teacher_preds)
@@ -1092,8 +1106,9 @@ class DetectionModel(BaseModel):
             sp_dfl = sp[:, :dfl_channels, :, :].view(b, 4, reg_max, h, w)
             tp_dfl = tp[:, :dfl_channels, :, :].view(b, 4, reg_max, h, w)
 
-            # Online distillation: keep teacher branch in-graph so both teacher and student can be updated.
-            tp_prob = F.softmax(tp_dfl / temperature, dim=2)
+            # Configurable distillation: optionally detach teacher branch for fixed-target distillation.
+            tp_dfl_for_distill = tp_dfl if update_teacher else tp_dfl.detach()
+            tp_prob = F.softmax(tp_dfl_for_distill / temperature, dim=2)
             sp_log_prob = F.log_softmax(sp_dfl / temperature, dim=2)
 
             kl_spatial = F.kl_div(sp_log_prob, tp_prob, reduction="none").sum(dim=2).mean(dim=1)
@@ -1111,7 +1126,14 @@ class DetectionModel(BaseModel):
 
         return distill_loss / max(total_weight, 1e-6)
 
-    def _compute_l2_bbox_distillation_loss(self, teacher_preds, student_preds, masks=None, level_weights=None):
+    def _compute_l2_bbox_distillation_loss(
+        self,
+        teacher_preds,
+        student_preds,
+        masks=None,
+        level_weights=None,
+        update_teacher=True,
+    ):
         """Compute L2 distillation over expected DFL box offsets with optional foreground masking."""
         teacher_feats = self._extract_train_feats(teacher_preds)
         student_feats = self._extract_train_feats(student_preds)
@@ -1138,7 +1160,8 @@ class DetectionModel(BaseModel):
             tp_dfl = tp[:, :dfl_channels, :, :].view(b, 4, reg_max, h, w)
 
             sp_prob = F.softmax(sp_dfl, dim=2)
-            tp_prob = F.softmax(tp_dfl, dim=2)
+            tp_dfl_for_distill = tp_dfl if update_teacher else tp_dfl.detach()
+            tp_prob = F.softmax(tp_dfl_for_distill, dim=2)
 
             sp_val = (sp_prob * bins).sum(dim=2) / reg_max
             tp_val = (tp_prob * bins).sum(dim=2) / reg_max

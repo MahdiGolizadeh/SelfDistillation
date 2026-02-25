@@ -43,6 +43,7 @@ print_bn_params_dims: False # (bool) request dual-BN params from loss output and
 cls_dist: False # (bool) enable KL class distillation from full-net teacher to subnet student
 cls_alpha: 1.0 # (float) base weight for KL class distillation (adapted online when enabled)
 cls_dist_t: 1.0 # (float) temperature for KL class distillation
+teacher_distill_update: True # (bool) if True teacher receives distillation gradients, else teacher is detached in all distillation losses
 level_weights: [1.0, 1.0, 1.0] # (list[float]) per-head weights for KL class distillation
 m2d2_dist: False # (bool) enable M2D2 DFL distillation from full-net teacher to subnet student
 m2d2_alpha: 1.0 # (float) base weight for M2D2 distillation (adapted online when enabled)
